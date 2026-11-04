@@ -6,11 +6,12 @@ from collections.abc import AsyncGenerator, Generator
 from contextlib import contextmanager, suppress
 import json
 import logging
+from pathlib import Path
 import socket
 from typing import cast
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 import uvicorn
 
@@ -72,6 +73,18 @@ def _sse_event(name: str, payload: dict[str, object]) -> bytes:
 
 def create_phone_app(bridge: PhoneBridge) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    plugin_dir = Path(__file__).resolve().parent
+
+    @app.get("/api/phone/apk")
+    async def download_apk() -> FileResponse:
+        apk_path = plugin_dir / "akashic-shell-v0.3.1.apk"
+        if not apk_path.is_file():
+            raise HTTPException(status_code=404, detail="APK 尚未构建")
+        return FileResponse(
+            apk_path,
+            media_type="application/vnd.android.package-archive",
+            filename="akashic-shell-v0.3.1.apk",
+        )
 
     @app.get("/api/phone/devices")
     async def list_devices() -> JSONResponse:

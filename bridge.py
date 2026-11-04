@@ -159,6 +159,14 @@ class PhoneBridge:
             if isinstance(frame.get("state"), Mapping):
                 self._apply_state_update(session, cast(Mapping[str, object], frame["state"]))
 
+    def handle_incoming_for_device(self, device_id: str, frame: Mapping[str, object]) -> bool:
+        """按 device_id 查找活跃节点并投递 HTTP 回传的响应帧或状态帧。"""
+        session = self._sessions.get(device_id)
+        if session is None or session.closed:
+            return False
+        self.handle_incoming(session, frame)
+        return True
+
     def _apply_state_update(self, session: _NodeSession, data: Mapping[str, object]) -> None:
         if "display_mode" in data:
             session.display_mode = _valid_display_mode(data.get("display_mode"))

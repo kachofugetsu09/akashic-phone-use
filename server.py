@@ -1,16 +1,16 @@
-"""Phone 端侧节点接入监听器：发布 /api/phone 端点，承接 Android Shell 的 WebSocket 与 HTTP 查询。"""
+"""Phone 端侧节点接入监听器：发布 /api/phone 端点，同时支持 WebSocket 与 SSE + POST 双向流。"""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import contextmanager, suppress
 import json
 import logging
 import socket
 from typing import cast
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketState
 import uvicorn
 
@@ -20,6 +20,7 @@ from core.common.unix_socket import prepare_unix_socket, socket_alias_path
 from .bridge import PhoneBridge
 
 logger = logging.getLogger(__name__)
+HEARTBEAT_SECONDS = 15.0
 
 
 class PhoneListenerServer(uvicorn.Server):
@@ -64,6 +65,11 @@ class PhoneListenerServer(uvicorn.Server):
             should_exit = await self.on_tick(counter)
 
 
+def _sse_event(name: str, payload: dict[str, object]) -> bytes:
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {name}\ndata: {data}\n\n".encode("utf-8")
+
+
 def create_phone_app(bridge: PhoneBridge) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -87,6 +93,76 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
             for d in bridge.list_devices()
         ]
         return JSONResponse({"devices": items})
+
+    @app.post("/api/phone/stream")
+    async def node_sse_stream(request: Request) -> StreamingResponse:
+        """供 Android Shell 原生 HttpURLConnection 建立长连接接收 RPC 指令（携带同源 Cookie 与 Origin）。"""
+        try:
+            hello = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="无效的 JSON hello 载荷") from error
+        if not isinstance(hello, dict) or hello.get("type") != "hello":
+            raise HTTPException(status_code=400, detail="首包必须是 type=hello")
+
+        queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
+
+        async def send_json(payload: dict[str, object]) -> None:
+            await queue.put(payload)
+
+        async def close_transport() -> None:
+            await queue.put(None)
+
+        try:
+            session = await bridge.register_node(
+                cast(dict[str, object], hello),
+                send_json=send_json,
+                close_transport=close_transport,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        async def events() -> AsyncGenerator[bytes, None]:
+            try:
+                yield _sse_event("welcome", {"device_id": session.device_id})
+                while not session.closed:
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+                    except TimeoutError:
+                        if await request.is_disconnected():
+                            break
+                        yield _sse_event("heartbeat", {})
+                        continue
+                    if item is None:
+                        break
+                    event_name = str(item.get("type") or "message")
+                    yield _sse_event(event_name, item)
+            except asyncio.CancelledError:
+                raise
+            finally:
+                await bridge.unregister_node(session)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/api/phone/reply")
+    async def node_http_reply(request: Request) -> JSONResponse:
+        """供 Android Shell 回传 RPC 执行结果或实时状态变更。"""
+        try:
+            frame = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="无效的 JSON 响应载荷") from error
+        if not isinstance(frame, dict):
+            raise HTTPException(status_code=400, detail="响应载荷必须是 JSON 对象")
+        device_id = str(frame.get("device_id") or "").strip()
+        if not device_id:
+            raise HTTPException(status_code=400, detail="缺少 device_id")
+        accepted = bridge.handle_incoming_for_device(device_id, cast(dict[str, object], frame))
+        if not accepted:
+            raise HTTPException(status_code=404, detail=f"设备 {device_id!r} 未注册或连接已断开")
+        return JSONResponse({"ok": True})
 
     @app.websocket("/api/phone/ws")
     async def node_ws(websocket: WebSocket) -> None:

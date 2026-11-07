@@ -21,7 +21,7 @@ from core.common.unix_socket import prepare_unix_socket, socket_alias_path
 from .bridge import PhoneBridge
 
 logger = logging.getLogger(__name__)
-HEARTBEAT_SECONDS = 15.0
+HEARTBEAT_SECONDS = 10.0
 
 
 class PhoneListenerServer(uvicorn.Server):
@@ -77,13 +77,13 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
 
     @app.get("/api/phone/apk")
     async def download_apk() -> FileResponse:
-        apk_path = plugin_dir / "akashic-shell-v0.3.1.apk"
+        apk_path = plugin_dir / "akashic-shell-v0.3.4.apk"
         if not apk_path.is_file():
             raise HTTPException(status_code=404, detail="APK 尚未构建")
         return FileResponse(
             apk_path,
             media_type="application/vnd.android.package-archive",
-            filename="akashic-shell-v0.3.1.apk",
+            filename="akashic-shell-v0.3.4.apk",
         )
 
     @app.get("/api/phone/devices")

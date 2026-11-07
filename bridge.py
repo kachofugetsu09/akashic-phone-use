@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -15,6 +16,12 @@ from .contract import (
     PhoneScreenSnapshot,
 )
 from .safety import detect_takeover_reason, parse_ui_nodes
+
+logger = logging.getLogger(__name__)
+# 端侧收到请求后立即回 ack；超过这个时间没有 ack 视为下行长连接已失效。
+ACK_TIMEOUT_S = 6.0
+# 判定长连接失效后，等待端侧重连的最长时间。
+RECONNECT_WAIT_S = 15.0
 
 
 class PhoneNodeError(RuntimeError):
@@ -37,8 +44,10 @@ class _NodeSession:
     takeover_reason: str | None
     send_json: Callable[[dict[str, object]], Awaitable[None]]
     close_transport: Callable[[], Awaitable[None]]
+    supports_ack: bool = False
+    connected_at: float = 0.0
     pending: dict[str, asyncio.Future[dict[str, object]]] = field(default_factory=dict)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    acks: dict[str, asyncio.Event] = field(default_factory=dict)
     closed: bool = False
 
     def descriptor(self) -> PhoneDeviceDescriptor:
@@ -75,6 +84,7 @@ class PhoneBridge:
 
     def __init__(self) -> None:
         self._sessions: dict[str, _NodeSession] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
         self._seq = 0
 
     def list_devices(self) -> tuple[PhoneDeviceDescriptor, ...]:
@@ -138,8 +148,14 @@ class PhoneBridge:
             takeover_reason=str(hello["takeover_reason"]) if isinstance(hello.get("takeover_reason"), str) and hello.get("takeover_reason") else None,
             send_json=send_json,
             close_transport=close_transport,
+            supports_ack=hello.get("supports_ack") is True,
+            connected_at=asyncio.get_running_loop().time(),
         )
         self._sessions[device_id] = session
+        logger.info(
+            "phone.node.registered device=%s shell=%s ack=%s vd=%s",
+            device_id, session.shell_version, session.supports_ack, vd_id,
+        )
         return session
 
     def handle_incoming(self, session: _NodeSession, frame: Mapping[str, object]) -> None:
@@ -150,6 +166,9 @@ class PhoneBridge:
         if frame_type == "state":
             self._apply_state_update(session, frame)
             return
+        if frame_type == "ack":
+            self._handle_ack(session, frame)
+            return
         if frame_type == "response":
             request_id = frame.get("request_id")
             if isinstance(request_id, str):
@@ -158,6 +177,18 @@ class PhoneBridge:
                     fut.set_result(dict(frame))
             if isinstance(frame.get("state"), Mapping):
                 self._apply_state_update(session, cast(Mapping[str, object], frame["state"]))
+
+    # 端侧确认收到请求；顺带上报上次回传失败等端侧诊断。
+    def _handle_ack(self, session: _NodeSession, frame: Mapping[str, object]) -> None:
+        request_id = frame.get("request_id")
+        if isinstance(request_id, str) and (event := session.acks.get(request_id)) is not None:
+            event.set()
+        errors = frame.get("recent_errors")
+        if isinstance(errors, list) and errors:
+            logger.warning(
+                "phone.node.diagnostics device=%s errors=%s",
+                session.device_id, [str(item)[:300] for item in errors[:10]],
+            )
 
     def handle_incoming_for_device(self, device_id: str, frame: Mapping[str, object]) -> bool:
         """按 device_id 查找活跃节点并投递 HTTP 回传的响应帧或状态帧。"""
@@ -198,6 +229,8 @@ class PhoneBridge:
         session.closed = True
         if self._sessions.get(session.device_id) is session:
             del self._sessions[session.device_id]
+        age = asyncio.get_running_loop().time() - session.connected_at
+        logger.info("phone.node.closed device=%s reason=%s age_s=%.0f", session.device_id, reason, age)
         for fut in tuple(session.pending.values()):
             if not fut.done():
                 fut.set_exception(PhoneNodeError(f"设备 {session.device_id} 连接中断: {reason}"))
@@ -218,40 +251,89 @@ class PhoneBridge:
         timeout_ms: int = 30_000,
     ) -> dict[str, object]:
         target_id = self.resolve_device_id(device_id)
-        session = self._sessions.get(target_id)
-        if session is None or session.closed:
-            raise PhoneNodeError(f"设备 {target_id!r} 不在线")
-        async with session.lock:
-            if session.closed:
-                raise PhoneNodeError(f"设备 {target_id!r} 已断开连接")
-            self._seq += 1
-            request_id = f"req-{self._seq}"
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future[dict[str, object]] = loop.create_future()
-            session.pending[request_id] = fut
-            try:
-                await session.send_json(
-                    {
-                        "type": "request",
-                        "request_id": request_id,
-                        "op": op,
-                        "payload": dict(payload),
-                    }
-                )
-                response = await asyncio.wait_for(fut, timeout=max(0.1, timeout_ms / 1000.0))
-            except TimeoutError as exc:
-                raise PhoneNodeError(f"设备 {target_id} 执行 {op} 超时 ({timeout_ms}ms)") from exc
-            except PhoneNodeError:
-                raise
-            except Exception as exc:
-                raise PhoneNodeError(f"设备 {target_id} 通信失败: {exc}") from exc
-            finally:
-                session.pending.pop(request_id, None)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.1, timeout_ms / 1000.0)
+        lock = self._locks.setdefault(target_id, asyncio.Lock())
+        async with lock:
+            # 1. 首发；端侧未确认说明下行长连接已失效，等它重连后在新连接上重发一次
+            response = await self._send_request(self._live_session(target_id), op, payload, deadline, timeout_ms, may_retry=True)
+            if response is None:
+                session = await self._wait_reconnect(target_id, deadline)
+                response = await self._send_request(session, op, payload, deadline, timeout_ms, may_retry=False)
+        assert response is not None
         if not response.get("ok", False):
             error_msg = str(response.get("error") or f"设备 {target_id} 拒绝执行 {op}")
             raise PhoneNodeError(error_msg)
         result = response.get("result")
         return dict(cast(Mapping[str, object], result)) if isinstance(result, Mapping) else {}
+
+    def _live_session(self, device_id: str) -> _NodeSession:
+        session = self._sessions.get(device_id)
+        if session is None or session.closed:
+            raise PhoneNodeError(f"设备 {device_id!r} 不在线")
+        return session
+
+    # 等端侧在新长连接上重新注册；超过截止时间或重连等待上限则报错。
+    async def _wait_reconnect(self, device_id: str, deadline: float) -> _NodeSession:
+        loop = asyncio.get_running_loop()
+        limit = min(deadline, loop.time() + RECONNECT_WAIT_S)
+        while loop.time() < limit:
+            session = self._sessions.get(device_id)
+            if session is not None and not session.closed:
+                return session
+            await asyncio.sleep(0.2)
+        raise PhoneNodeError(f"设备 {device_id} 下行连接失效，且未在 {RECONNECT_WAIT_S:.0f}s 内重连")
+
+    # 发出一次请求并等待回包；端侧支持 ack 却没确认时，可重试则返回 None。
+    async def _send_request(
+        self,
+        session: _NodeSession,
+        op: str,
+        payload: Mapping[str, object],
+        deadline: float,
+        timeout_ms: int,
+        *,
+        may_retry: bool,
+    ) -> dict[str, object] | None:
+        loop = asyncio.get_running_loop()
+        self._seq += 1
+        request_id = f"req-{self._seq}"
+        fut: asyncio.Future[dict[str, object]] = loop.create_future()
+        ack = asyncio.Event()
+        session.pending[request_id] = fut
+        session.acks[request_id] = ack
+        started = loop.time()
+        tag = f"device={session.device_id} op={op} request={request_id}"
+        try:
+            await session.send_json({"type": "request", "request_id": request_id, "op": op, "payload": dict(payload)})
+            # 1. 等端侧确认收到；回包先到也算确认
+            if session.supports_ack and not await _wait_ack(ack, fut, min(ACK_TIMEOUT_S, deadline - loop.time())):
+                logger.warning("phone.rpc.unacked %s waited_ms=%d", tag, (loop.time() - started) * 1000)
+                _ = session.pending.pop(request_id, None)
+                await self._evict_session(session, "请求未被端侧确认，下行连接疑似已失效")
+                if may_retry and deadline - loop.time() > 1.0:
+                    return None
+                raise PhoneNodeError(f"设备 {session.device_id} 没有收到 {op} 请求（下行连接失效）")
+            acked_ms = (loop.time() - started) * 1000
+            # 2. 等回包
+            try:
+                response = await asyncio.wait_for(fut, timeout=max(0.1, deadline - loop.time()))
+            except TimeoutError as exc:
+                logger.warning("phone.rpc.timeout %s acked=%s ack_ms=%d", tag, ack.is_set(), acked_ms)
+                stage = "已收到请求但未在时限内回传结果" if ack.is_set() else "无响应"
+                raise PhoneNodeError(f"设备 {session.device_id} 执行 {op} 超时 ({timeout_ms}ms)：{stage}") from exc
+            except PhoneNodeError:
+                raise
+            except Exception as exc:
+                raise PhoneNodeError(f"设备 {session.device_id} 通信失败: {exc}") from exc
+        finally:
+            _ = session.pending.pop(request_id, None)
+            _ = session.acks.pop(request_id, None)
+        logger.info(
+            "phone.rpc.done %s ack_ms=%d total_ms=%d timing=%s",
+            tag, acked_ms, (loop.time() - started) * 1000, response.get("timing"),
+        )
+        return response
 
     async def observe(
         self,
@@ -369,3 +451,16 @@ class PhoneBridge:
             screenshot_png=png_bytes,
             takeover_reason=takeover,
         )
+
+
+# 等 ack 或回包任一到达；超时返回 False。
+async def _wait_ack(ack: asyncio.Event, fut: asyncio.Future[dict[str, object]], timeout_s: float) -> bool:
+    if ack.is_set() or fut.done():
+        return True
+    waiter = asyncio.ensure_future(ack.wait())
+    try:
+        done, _ = await asyncio.wait((waiter, fut), timeout=max(0.1, timeout_s), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not waiter.done():
+            _ = waiter.cancel()
+    return bool(done)

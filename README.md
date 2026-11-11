@@ -35,6 +35,11 @@
 - WebSocket 帧继续由所属 session 绑定；其 welcome 也提供 `connection_id`，用于可选的 HTTP 回传。
 - `/api/phone/apk` 只提供 `akashic-shell-v0.5.0.apk`。兼容的 release 制品缺席时明确返回 HTTP 404，不回退到仓库中的旧版 APK；debug 构建不等同已发布 release。
 
+仓库配套 APK 的源码提交、SHA-256、包版本与证书指纹见
+[`akashic-shell-v0.5.0.provenance.json`](akashic-shell-v0.5.0.provenance.json)。
+这是启用 R8 的 `release` 变体，沿用 Shell 仓库当前的 **Android Debug 签名配置**；
+不表示已发布正式签名或 GitHub Release。旧的 0.3.4 文件已移除，下载端点不会提供不兼容版本。
+
 ## 验证命令
 
 ```sh

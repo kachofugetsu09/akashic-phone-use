@@ -147,17 +147,27 @@ async def test_legacy_client_and_missing_identity_fail_without_replacing_session
 
 @pytest.mark.asyncio
 async def test_apk_download_does_not_fall_back_to_incompatible_binary(tmp_path, monkeypatch) -> None:
-    """仅存在旧版真实制品时，下载入口必须明确失败，不能把它当兼容版本。"""
+    """仅存在旧版制品路径时，下载入口必须拒绝，不能把旧文件当兼容版本。"""
     from phone_sse_pkg import server as server_module
-    (tmp_path / "akashic-shell-v0.3.4.apk").write_bytes(
-        (_root / "akashic-shell-v0.3.4.apk").read_bytes()
-    )
+    (tmp_path / "akashic-shell-v0.3.4.apk").write_bytes(b"incompatible test artifact")
     monkeypatch.setattr(server_module, "__file__", str(tmp_path / "server.py"))
     async with phone_server() as (_, client):
         response = await client.get("/api/phone/apk")
         assert response.status_code == 404
         assert "0.5.0" in response.json()["detail"]
         assert "release APK 尚未打包" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_apk_download_serves_the_bundled_matching_artifact() -> None:
+    """下载入口必须返回随附的兼容 APK 原文和安装文件名。"""
+    apk = _root / "akashic-shell-v0.5.0.apk"
+    async with phone_server() as (_, client):
+        response = await client.get("/api/phone/apk")
+        assert response.status_code == 200
+        assert response.content == apk.read_bytes()
+        assert response.headers["content-type"] == "application/vnd.android.package-archive"
+        assert 'filename="akashic-shell-v0.5.0.apk"' in response.headers["content-disposition"]
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ import base64
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
 
 from .contract import (
@@ -26,6 +26,10 @@ CLOSE_TIMEOUT_S = 5.0
 
 class PhoneNodeError(RuntimeError):
     """端侧节点不在线、断连、超时或拒绝执行。"""
+
+    def __init__(self, message: str, *, outcome: Literal["not_sent", "unknown"] = "not_sent") -> None:
+        super().__init__(message)
+        self.outcome = outcome
 
 
 @dataclass
@@ -87,6 +91,12 @@ class PhoneBridge:
         self._sessions: dict[str, _NodeSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._closing_transports: set[asyncio.Task[None]] = set()
+        self._connection_changed = asyncio.Event()
+
+    async def wait_connection_change(self) -> None:
+        """唤醒唯一 Turn follower；扫描期间的连接变化保留到下次扫描。"""
+        await self._connection_changed.wait()
+        self._connection_changed.clear()
 
     def list_devices(self) -> tuple[PhoneDeviceDescriptor, ...]:
         return tuple(
@@ -159,6 +169,7 @@ class PhoneBridge:
             connected_at=asyncio.get_running_loop().time(),
         )
         self._sessions[device_id] = session
+        self._connection_changed.set()
         logger.info(
             "phone.node.registered device=%s shell=%s ack=%s vd=%s",
             device_id, session.shell_version, session.supports_ack, vd_id,
@@ -241,6 +252,7 @@ class PhoneBridge:
         session.closed = True
         if self._sessions.get(session.device_id) is session:
             del self._sessions[session.device_id]
+            self._connection_changed.set()
         age = asyncio.get_running_loop().time() - session.connected_at
         logger.info("phone.node.closed device=%s reason=%s age_s=%.0f", session.device_id, reason, age)
         for fut in tuple(session.pending.values()):
@@ -280,6 +292,7 @@ class PhoneBridge:
         payload: Mapping[str, object],
         *,
         timeout_ms: int = 30_000,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> dict[str, object]:
         """排队等待受调用期限约束，过期请求不再发往端侧。"""
         target_id = self.resolve_device_id(device_id)
@@ -297,6 +310,15 @@ class PhoneBridge:
             # 锁可立即取得时未必让出事件循环，仍须拒绝已经过期的请求。
             if loop.time() >= deadline:
                 raise PhoneNodeError(not_sent)
+            # owner 回执与发送共用此锁及期限，不能在检查后让别的 Turn 抢先使用设备。
+            if before_send is not None:
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await before_send()
+                except TimeoutError as exc:
+                    raise PhoneNodeError(not_sent) from exc
+                if loop.time() >= deadline:
+                    raise PhoneNodeError(not_sent)
             # 2. 发送后的断连或超时由 _send_request 报告结果不确定。
             # ACK 或结果丢失不能证明端侧未执行；每次调用只发送一次。
             response = await self._send_request(self._live_session(target_id), op, payload, deadline, timeout_ms)
@@ -304,7 +326,7 @@ class PhoneBridge:
             lock.release()
         if not response.get("ok", False):
             error_msg = str(response.get("error") or f"设备 {target_id} 拒绝执行 {op}")
-            raise PhoneNodeError(error_msg)
+            raise PhoneNodeError(error_msg, outcome="unknown")
         result = response.get("result")
         return dict(cast(Mapping[str, object], result)) if isinstance(result, Mapping) else {}
 
@@ -357,7 +379,8 @@ class PhoneBridge:
         except (PhoneNodeError, OSError) as exc:
             raise PhoneNodeError(
                 f"设备 {session.device_id} 执行 {op} 的结果不确定，可能已执行；"
-                f"未自动重试。请在设备在线后先调用 phone_observe 核实，再决定是否继续。原因：{exc}"
+                f"未自动重试。请在设备在线后先调用 phone_observe 核实，再决定是否继续。原因：{exc}",
+                outcome="unknown",
             ) from exc
         finally:
             _ = session.pending.pop(request_id, None)
@@ -374,6 +397,7 @@ class PhoneBridge:
         *,
         include_screenshot: bool = False,
         timeout_ms: int = 20_000,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> PhoneScreenSnapshot:
         target_id = self.resolve_device_id(device_id)
         raw = await self.rpc(
@@ -381,6 +405,7 @@ class PhoneBridge:
             "observe",
             {"include_screenshot": include_screenshot},
             timeout_ms=timeout_ms,
+            before_send=before_send,
         )
         return self._decode_snapshot(target_id, raw)
 
@@ -390,6 +415,7 @@ class PhoneBridge:
         payload: Mapping[str, object],
         *,
         timeout_ms: int = 30_000,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[str, PhoneScreenSnapshot | None]:
         target_id = self.resolve_device_id(device_id)
         session = self._sessions.get(target_id)
@@ -402,7 +428,7 @@ class PhoneBridge:
                 f"设备 {target_id} 当前正在等待用户主屏接管 ({session.takeover_reason})；"
                 "可先调用 phone_observe 查看状态；用户完成后调用 resume_from_user。"
             )
-        raw = await self.rpc(target_id, "action", payload, timeout_ms=timeout_ms)
+        raw = await self.rpc(target_id, "action", payload, timeout_ms=timeout_ms, before_send=before_send)
         summary = str(raw.get("message") or f"已执行 {action}")
         raw_screen = raw.get("screen")
         snapshot = (
@@ -420,6 +446,7 @@ class PhoneBridge:
         close_packages: tuple[str, ...] = (),
         reason: str = "completed",
         timeout_ms: int = 15_000,
+        before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> dict[str, object]:
         target_id = self.resolve_device_id(device_id)
         return await self.rpc(
@@ -431,6 +458,7 @@ class PhoneBridge:
                 "reason": reason,
             },
             timeout_ms=timeout_ms,
+            before_send=before_send,
         )
 
     def _decode_snapshot(self, device_id: str, raw: Mapping[str, object]) -> PhoneScreenSnapshot:

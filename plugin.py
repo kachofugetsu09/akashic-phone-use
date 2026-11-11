@@ -1,10 +1,11 @@
 """Phone 端侧能力外置插件（phone-use）：按需加载（load_tools）、无线调试后台虚拟屏控制与 Turn 级生命周期。"""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import ValidationError
 
@@ -48,6 +49,21 @@ class PhoneCallIdentity:
     device_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class PhoneCleanupResult:
+    outcome: Literal["confirmed", "not_sent", "unknown"]
+    reason: str | None = None
+    superseded: bool = False
+
+
+class _TurnSuperseded(RuntimeError):
+    """设备已经交给另一个 Turn；旧 Turn 不能再释放它。"""
+
+
+class _TurnAlreadyFinished(RuntimeError):
+    """设备回执已经确认收尾，恢复时不再发送。"""
+
+
 def _parse_call_identity(arguments: Mapping[str, object], default_device: str) -> PhoneCallIdentity:
     value = arguments.get("_phone")
     if not isinstance(value, Mapping) or set(value) != {"session_id", "source", "turn_input_id"}:
@@ -86,6 +102,7 @@ class PhoneControl:
         keep_packages: tuple[str, ...] = (),
         close_packages: tuple[str, ...] = (),
     ) -> None:
+        """在设备发送锁内原子保存调用身份与最新 Turn 使用权。"""
         owner_key = "phone-use:" + key
         value: dict[str, object] = {
             "v": 1,
@@ -99,13 +116,25 @@ class PhoneControl:
             "close_packages": list(close_packages),
         }
         state = self._state()
-        existing = await run_file_io(lambda: state.read(owner_key))
-        if existing is None:
-            _ = await state.transact_async(lambda tx: tx.save(owner_key, value, expected_version=None))
-        elif existing.value.get("phase") == "ended" and _same_record(existing.value, value):
-            raise RuntimeError("Phone 调用已经结束")
-        elif not _same_record(existing.value, value):
-            raise ValueError("Phone 调用回执身份不一致")
+
+        def claim(tx) -> None:
+            existing = tx.read(owner_key)
+            if existing is None:
+                _ = tx.save(owner_key, value, expected_version=None)
+            elif not _same_record(existing.value, value):
+                raise ValueError("Phone 调用回执身份不一致")
+            elif existing.value.get("phase") != "started":
+                raise RuntimeError("Phone 调用已经结束或收尾结果未知")
+            # 此回执仅表示当前设备使用权；不改写任何既有调用的身份或结果。
+            device_key = "phone-device:" + identity.device_id
+            current = tx.read(device_key)
+            _ = tx.save(device_key, {
+                "v": 1, "control_binding": control_binding,
+                "session_id": identity.session_id, "source": identity.source,
+                "turn_input_id": identity.turn_input_id, "device_id": identity.device_id,
+            }, expected_version=current.version if current else None)
+
+        await state.transact_async(claim)
 
     async def observe(
         self,
@@ -116,11 +145,11 @@ class PhoneControl:
         requested_device = cast(str | None, arguments.get("device_id"))
         device_id = self.bridge.resolve_device_id(requested_device)
         identity = _parse_call_identity(arguments, device_id)
-        await self._record_started(key, control_binding, identity)
         return await self.bridge.observe(
             device_id,
             include_screenshot=bool(arguments.get("include_screenshot", False)),
             timeout_ms=int(arguments.get("timeout_ms", 20_000)),
+            before_send=lambda: self._record_started(key, control_binding, identity),
         )
 
     async def action(
@@ -134,37 +163,80 @@ class PhoneControl:
         identity = _parse_call_identity(arguments, device_id)
         keep = tuple(str(x) for x in cast(list[object], arguments.get("keep_packages", [])) if isinstance(x, str))
         close = tuple(str(x) for x in cast(list[object], arguments.get("close_packages", [])) if isinstance(x, str))
-        await self._record_started(
-            key,
-            control_binding,
-            identity,
-            keep_packages=keep,
-            close_packages=close,
-        )
         payload = {k: v for k, v in arguments.items() if k != "_phone" and v is not None}
         return await self.bridge.perform_action(
             device_id,
             payload,
             timeout_ms=int(arguments.get("timeout_ms", 30_000)),
+            before_send=lambda: self._record_started(
+                key, control_binding, identity, keep_packages=keep, close_packages=close,
+            ),
         )
 
     async def end_turn(
         self,
-        device_id: str,
+        identity: PhoneCallIdentity,
         *,
         keep_packages: tuple[str, ...] = (),
         close_packages: tuple[str, ...] = (),
-    ) -> None:
+    ) -> PhoneCleanupResult:
+        """仅当前 Turn 可收尾；未发送可在连接变化后重访，未知效果不重放。"""
+        state = self._state()
+        device_key = "phone-device:" + identity.device_id
+        marker: OwnerRecord | None = None
+
+        # 1. 发送锁内检查 owner，并先提交可跨换代保留的未知回执。
+        async def check_owner() -> None:
+            def prepare(tx):
+                current = tx.read(device_key)
+                if current is None:
+                    raise PhoneNodeError("缺少设备当前 Turn 回执；收尾未发送，请观察设备后显式恢复")
+                expected = (identity.session_id, identity.source, identity.turn_input_id)
+                actual = tuple(current.value[field] for field in ("session_id", "source", "turn_input_id"))
+                if actual != expected:
+                    raise _TurnSuperseded("设备已由新 Turn 使用；旧 Turn 未发送收尾")
+                if current.value.get("cleanup_outcome") == "confirmed":
+                    raise _TurnAlreadyFinished()
+                if current.value.get("cleanup_outcome") == "unknown":
+                    raise PhoneNodeError("上次收尾结果未知，未自动重放；请观察设备后显式恢复", outcome="unknown")
+                # 先记未知再发出，取消/进程退出不能把已发送的 finish 恢复成可重试。
+                return tx.save(device_key, {**current.value, "cleanup_outcome": "unknown",
+                                           "cleanup_reason": "收尾准备发送后尚未确认；取消或退出不能证明未执行"},
+                               expected_version=current.version)
+
+            def committed(record: OwnerRecord) -> None:
+                nonlocal marker
+                marker = record
+
+            _ = await state.transact_async(prepare, on_commit=committed)
+
+        # 2. 仅确定未发送允许以后重访；发送后的异常保留未知效果。
         try:
             _ = await self.bridge.finish_display(
-                device_id,
+                identity.device_id,
                 keep_packages=keep_packages,
                 close_packages=close_packages,
                 reason="turn_ended",
+                before_send=check_owner,
             )
-        except PhoneNodeError:
-            # 手机端已在 Turn 闭合前离线时，端侧本地 watchdog 会自行释放虚拟屏，不阻塞账本收尾。
-            pass
+        except _TurnSuperseded as error:
+            return PhoneCleanupResult("not_sent", str(error), superseded=True)
+        except _TurnAlreadyFinished:
+            return PhoneCleanupResult("confirmed")
+        except PhoneNodeError as error:
+            result = PhoneCleanupResult(error.outcome, str(error))
+        else:
+            result = PhoneCleanupResult("confirmed")
+        # 3. 新调用可能已接替设备，只结算仍属于本次发送的回执版本。
+        if marker is not None and result.outcome != "unknown":
+            def settle(tx) -> None:
+                current = tx.read(device_key)
+                if current is not None and current.version == marker.version:
+                    _ = tx.save(device_key, {**current.value, "cleanup_outcome": result.outcome,
+                                             "cleanup_reason": result.reason},
+                                expected_version=current.version)
+            await state.transact_async(settle)
+        return result
 
 
 class _PhoneObserveTool:
@@ -382,11 +454,28 @@ async def _start_follower(ctx: Context) -> None:
             else:
                 checked[group] = head
 
-    async with ctx.runtime_scope():
-        await once()
-    async for _heads in catalog.follow():
-        async with ctx.runtime_scope():
-            await once()
+    wake = asyncio.Event()
+
+    async def follow_messages() -> None:
+        async for _heads in catalog.follow():
+            wake.set()
+
+    async def follow_connections() -> None:
+        bridge = ctx.require(PHONE_BRIDGE)
+        while True:
+            await bridge.wait_connection_change()
+            wake.set()
+
+    # 连接变化不追加 Message；它只唤醒已有 not_sent 收尾，不靠定时轮询。
+    async with asyncio.TaskGroup() as tasks:
+        _ = tasks.create_task(follow_messages())
+        _ = tasks.create_task(follow_connections())
+        wake.set()
+        while True:
+            await wake.wait()
+            wake.clear()
+            async with ctx.runtime_scope():
+                await once()
 
 
 async def _try_end(
@@ -438,14 +527,21 @@ async def _try_end(
     bindings = ctx.require(BINDINGS)
     try:
         async with bindings.open(binding, PHONE_CONTROL) as (bound, _):
-            await bound.end_turn(device_id, keep_packages=tuple(keep), close_packages=tuple(close))
+            result = await bound.end_turn(
+                PhoneCallIdentity(cast(str, value["session_id"]), cast(str, value["source"]),
+                                  cast(str, value["turn_input_id"]), device_id),
+                keep_packages=tuple(keep), close_packages=tuple(close),
+            )
     except (KeyError, ValueError) as error:
         await _mark_records(ctx, records, phase="failed", error=f"phone control binding 不可用: {error}")
         return True
     except Exception as error:
         ctx.report_incident("phone-end-turn", f"{key}: {error}")
         return True
-    await _mark_records(ctx, records, phase="ended")
+    phase = "ended" if result.outcome == "confirmed" or result.superseded else (
+        "cleanup_unknown" if result.outcome == "unknown" else "started"
+    )
+    await _mark_records(ctx, records, phase=phase, error=result.reason, cleanup_outcome=result.outcome)
     return True
 
 
@@ -455,6 +551,7 @@ async def _mark_records(
     *,
     phase: str,
     error: str | None = None,
+    cleanup_outcome: str | None = None,
 ) -> None:
     state = ctx.require(OWNER_STATE).open(ctx)
 
@@ -470,6 +567,10 @@ async def _mark_records(
             updated = {**item_record.value, "phase": phase}
             if error is not None:
                 updated["error"] = error
+            if cleanup_outcome is not None:
+                updated["cleanup_outcome"] = cleanup_outcome
+                if error is None:
+                    _ = updated.pop("error", None)
             _ = tx.save(item_key, updated, expected_version=item_record.version)
 
     await state.transact_async(commit)

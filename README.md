@@ -70,3 +70,26 @@ AKASHIC_CORE_ROOT=/path/to/core /path/to/python snapshot_ref_scenario.py
 
 覆盖 schema 暴露引用、缺少引用不发送、观察和动作结果完整展示引用、动作原样传回引用；
 它不验证 Android 的节点归属检查，也不是固定预算模型成功率。
+
+## 并发 Turn 与收尾结果
+
+同一手机由最新提交设备调用的 Turn 拥有收尾权。若 A 使用手机后 B 已提交调用，A 闭合只结束自己的记录，不释放 B 正在用的屏幕。当前 Turn 身份保存在既有 `OWNER_STATE` 的 `phone-device:*` 回执中；claim、owner 检查和发送共用 Bridge 的设备锁，旧 binding 仍打开当前 provider。此合同不隔离不同 Turn 的应用内容；并行对话仍共享同一屏幕。
+
+```text
+┌──────────────┐    ┌────────────────────────────────────┐
+│ Turn A 闭合  ├───►│ 设备锁：当前 owner 仍是 A？          │
+└──────────────┘    ├───────────────┬────────────────────┤
+                   │ 是：发送 finish│ 否：只结束 A 的记录 │
+                   └───────────────┴────────────────────┘
+```
+
+- `cleanup_outcome=confirmed`：端侧已回传成功结果；调用记录为 `ended`。
+- `not_sent`：确定未发送；暂时离线的记录保留 `started`，消息或连接变化会重访。若新 Turn 已占用，旧记录直接结束并保留未发送原因。
+- `unknown`：可能已执行，调用记录为 `cleanup_unknown`，保留原因，重连或插件换代均不自动重放。先观察设备，再按用户当前意图显式恢复。发送前先将设备回执记为未知，以覆盖取消或进程退出窗口。
+- 设备回执 IO 也消耗原调用期限；过期不发送。Core 取消磁盘事务时会等待实际磁盘工作结束，不能把取消当作已回滚。
+
+真实 Core 与本地 UDS WebSocket 回归（故障节点 fixture，不代表 Android 真机验收）：
+
+```sh
+AKASHIC_CORE_ROOT=/path/to/akashic-agent python3 turn_owner_scenario.py
+```

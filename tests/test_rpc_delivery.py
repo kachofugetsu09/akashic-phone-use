@@ -412,8 +412,14 @@ async def test_snapshot_ref_survives_transport_decode_and_render_without_action_
 
 
 @pytest.mark.asyncio
-async def test_missing_snapshot_ref_is_upgrade_error_not_invented_latest_ref() -> None:
+@pytest.mark.parametrize("op", ["observe", "action"])
+async def test_missing_snapshot_ref_is_unknown_after_one_sent_request(op: str) -> None:
+    """RPC 成功后缺失快照引用不代表未执行，也不触发自动重发。"""
     async with peer_connection("screen_without_ref", {"nodes": []}) as (bridge, peer):
-        with pytest.raises(PhoneNodeError, match="snapshot_ref.*0.5.0"):
-            await bridge.observe(None)
-        assert len(peer.requests) == 1
+        with pytest.raises(PhoneNodeError, match="snapshot_ref.*可能已执行.*0.5.0") as caught:
+            if op == "observe":
+                await bridge.observe(None)
+            else:
+                await bridge.perform_action(None, {"action": "tap", "x": 10, "y": 10})
+        assert caught.value.outcome == "unknown"
+        assert len(peer.requests) == 1 and peer.requests[0]["op"] == op

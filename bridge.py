@@ -464,7 +464,11 @@ class PhoneBridge:
     def _decode_snapshot(self, device_id: str, raw: Mapping[str, object]) -> PhoneScreenSnapshot:
         snapshot_ref = raw.get("snapshot_ref")
         if not isinstance(snapshot_ref, str) or not snapshot_ref or len(snapshot_ref) > 128:
-            raise PhoneNodeError("端侧快照缺少合法 snapshot_ref，请升级 Akashic Shell 至 0.5.0 并重新观察")
+            raise PhoneNodeError(
+                "端侧快照缺少合法 snapshot_ref，结果不确定，可能已执行；不能据此判定动作未执行。"
+                "未自动重试，请升级 Akashic Shell 至 0.5.0 并重新观察后核实效果。",
+                outcome="unknown",
+            )
         session = self._sessions.get(device_id)
         nodes = parse_ui_nodes(raw.get("nodes"))
         package_name = str(raw.get("package_name") or "com.android.shell")

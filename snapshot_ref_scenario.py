@@ -57,6 +57,7 @@ async def main() -> None:
     ws = None
     peer_task = None
     wire: list[dict] = []
+    omit_ref = False
     try:
         # 1. Load the actual Core owners and bind the registered tools.
         await host.load_all()
@@ -91,6 +92,8 @@ async def main() -> None:
                     await ws.send(json.dumps({"type": "ack", "request_id": request["request_id"]}))
                     screen = {"snapshot_ref": request["request_id"], "display_id": 2,
                         "nodes": [{"node_id": 1, "text": "fixture", "bounds": [0, 0, 20, 20], "editable": True}]}
+                    if omit_ref:
+                        del screen["snapshot_ref"]
                     result = screen if request["op"] == "observe" else {"message": "fixture received", "screen": screen}
                     await ws.send(json.dumps({"type": "response", "request_id": request["request_id"], "ok": True, "result": result}))
             except ConnectionClosed:
@@ -136,7 +139,13 @@ async def main() -> None:
         # 4. Coordinates do not use cached nodes and need no invented reference.
         coordinate = await call("phone_action", {"description": "coordinate fixture", "action": "tap", "x": 10, "y": 10})
         assert coordinate.outcome == "success" and wire[-1]["payload"].get("snapshot_ref") is None
-        result = {"ok": True, "missing_ref_not_sent": True, "ref_rendered_and_forwarded": True,
+        # 5. A successful RPC with an undecodable screen has an unknown effect, not a safe retry.
+        omit_ref = True
+        before = len(wire)
+        unknown = await call("phone_action", {"description": "missing response reference", "action": "tap", "x": 10, "y": 10})
+        assert unknown.outcome == "error" and "结果不确定，可能已执行" in unknown.parts[0].value
+        assert len(wire) == before + 1
+        result = {"ok": True, "missing_response_ref_unknown_no_retry": True, "missing_ref_not_sent": True, "ref_rendered_and_forwarded": True,
             "coordinate_without_ref": True, "android_owner_checks_tested": False, "wire": wire}
         (base / "result.json").write_text(json.dumps(result, indent=2))
         print("SNAPSHOT_REF_CORE_PASS", base, flush=True)

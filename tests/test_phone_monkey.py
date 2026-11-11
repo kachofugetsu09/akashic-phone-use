@@ -60,7 +60,12 @@ class _SimulatedAndroidNode:
         self.payment_page = False
 
     async def connect(self) -> None:
-        self.session = await self.bridge.register_node(
+        async def close_transport() -> None:
+            # 旧连接的迟到 close 不能把同一模拟设备的新连接标为已关闭。
+            if self.session is session:
+                self.closed = True
+
+        session = await self.bridge.register_node(
             {
                 "type": "hello",
                 "device_id": self.device_id,
@@ -77,12 +82,10 @@ class _SimulatedAndroidNode:
                 "takeover_reason": self.takeover_reason,
             },
             send_json=self._on_server_message,
-            close_transport=self._on_close,
+            close_transport=close_transport,
         )
+        self.session = session
         self.closed = False
-
-    async def _on_close(self) -> None:
-        self.closed = True
 
     async def _on_server_message(self, message: dict[str, object]) -> None:
         if message.get("type") != "request":

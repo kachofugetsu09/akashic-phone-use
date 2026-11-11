@@ -120,12 +120,15 @@ class PhoneBridge:
         send_json: Callable[[dict[str, object]], Awaitable[None]],
         close_transport: Callable[[], Awaitable[None]],
     ) -> _NodeSession:
+        """同步替换当前连接，物理关闭旧传输不阻塞后续注册。"""
         device_id = str(hello.get("device_id") or "").strip()
         if not device_id or len(device_id) > 128:
             raise ValueError("端侧注册缺少合法的 device_id")
         previous = self._sessions.get(device_id)
         if previous is not None and not previous.closed:
-            await self._evict_session(previous, "已被同一 device_id 的新连接接替")
+            # deadline=now 只同步失效并跟踪 close，不在此让出；后来的注册始终获胜。
+            await self._evict_session(previous, "已被同一 device_id 的新连接接替",
+                                      deadline=asyncio.get_running_loop().time())
         raw_packages = hello.get("active_packages")
         packages = (
             tuple(str(item) for item in raw_packages if isinstance(item, str) and item)

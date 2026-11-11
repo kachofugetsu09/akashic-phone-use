@@ -466,3 +466,78 @@ async def test_unacked_websocket_close_backpressure_does_not_hold_rpc_or_shutdow
                 release_close.set()
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_latest_sse_registration_wins_while_previous_websocket_close_is_blocked(cancel_first) -> None:
+    """旧 WS 关闭受阻时，两个真实 SSE 注册不能反向覆盖或留下孤儿。"""
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    first_finished = asyncio.Event()
+    stream_count = 0
+
+    def block_old_close(app):
+        async def wrapped(scope, receive, send):
+            nonlocal stream_count
+            is_first = False
+            if scope["type"] == "http" and scope["path"] == "/api/phone/stream":
+                stream_count += 1
+                is_first = stream_count == 1
+
+            async def send_frame(message):
+                if message["type"] == "websocket.close":
+                    close_started.set()
+                    await release_close.wait()
+                await send(message)
+            try:
+                await app(scope, receive, send_frame)
+            finally:
+                if is_first:
+                    first_finished.set()
+        return wrapped
+
+    async with phone_server(block_old_close) as (bridge, client):
+        url = str(client.base_url).replace("http://", "ws://").rstrip("/") + "/api/phone/ws"
+        async with connect(url) as old:
+            await old.send(json.dumps({"type": "hello", "device_id": "sse-peer"}))
+            await old.recv()
+            request = client.build_request("POST", "/api/phone/stream", json={
+                "type": "hello", "device_id": "sse-peer", "device_name": "first",
+                "supports_ack": True, "supports_connection_id": True,
+            })
+            first = asyncio.create_task(client.send(request, stream=True))
+            try:
+                await asyncio.wait_for(close_started.wait(), 2)
+                async with sse_peer(client) as second:
+                    if cancel_first:
+                        first.cancel()
+                        result = (await asyncio.gather(first, return_exceptions=True))[0]
+                        if isinstance(result, httpx.Response):
+                            await result.aclose()
+                    release_close.set()
+                    if cancel_first:
+                        await asyncio.wait_for(first_finished.wait(), 2)
+                    else:
+                        response = await asyncio.wait_for(first, 2)
+                        assert response.status_code == 200
+                        first_peer = SsePeer(client, response, "sse-peer", None, response.aiter_lines())
+                        assert (await first_peer.next_event())[0] == "welcome"
+                    assert bridge._sessions["sse-peer"].connection_id == second.connection_id
+                    if not cancel_first:
+                        assert await first_peer.next_event() is None
+                    pending = asyncio.create_task(bridge.rpc(None, "observe", {}))
+                    try:
+                        current = await second.request()
+                        assert (await second.reply({"type": "response", "request_id": current["request_id"],
+                            "ok": True, "result": {"winner": "second"}})).status_code == 200
+                        assert await pending == {"winner": "second"}
+                    finally:
+                        pending.cancel()
+                        await asyncio.gather(pending, return_exceptions=True)
+            finally:
+                release_close.set()
+                first.cancel()
+                result = (await asyncio.gather(first, return_exceptions=True))[0]
+                if isinstance(result, httpx.Response):
+                    await result.aclose()

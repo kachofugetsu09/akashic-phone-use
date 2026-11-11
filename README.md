@@ -93,3 +93,10 @@ AKASHIC_CORE_ROOT=/path/to/core /path/to/python snapshot_ref_scenario.py
 ```sh
 AKASHIC_CORE_ROOT=/path/to/akashic-agent python3 turn_owner_scenario.py
 ```
+
+## 当前应用身份的未知值
+
+`PhoneScreenSnapshot.package_name` / `activity_name` 保持字符串；端侧缺失、null 或空串
+都解码为空串，工具展示 `unknown`，不会补造 `com.android.shell/MainActivity`。
+包名已知但 Activity 未知时分别显示。Shell 也需配套停止使用跨屏历史事件和默认包名；
+新插件无法辨认旧 Shell 已经填入的假名称。该字段是观察结果，不是动作的目标应用参数。

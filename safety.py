@@ -50,7 +50,7 @@ def format_screen_snapshot(snapshot: PhoneScreenSnapshot) -> str:
     header = [
         f"Snapshot: snapshot_ref={snapshot.snapshot_ref}",
         f"Device: {snapshot.device_id} | VirtualDisplay: #{snapshot.display_id} ({snapshot.width}x{snapshot.height} rot={snapshot.rotation})",
-        f"Foreground: {snapshot.package_name}/{snapshot.activity_name} | PiP: {snapshot.pip_state} | AudioMuted: {snapshot.audio_muted}",
+        f"Foreground: {snapshot.package_name or 'unknown'}/{snapshot.activity_name or 'unknown'} | PiP: {snapshot.pip_state} | AudioMuted: {snapshot.audio_muted}",
     ]
     if snapshot.takeover_reason:
         header.append(f"TAKEOVER REQUIRED: {snapshot.takeover_reason}")

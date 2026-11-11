@@ -56,7 +56,7 @@ class PhoneScreenSnapshot:
     width: int
     height: int
     rotation: int
-    package_name: str
+    package_name: str  # 空串表示本次观察无法确定。
     activity_name: str
     pip_state: PhonePipState
     audio_muted: bool

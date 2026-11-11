@@ -471,8 +471,8 @@ class PhoneBridge:
             )
         session = self._sessions.get(device_id)
         nodes = parse_ui_nodes(raw.get("nodes"))
-        package_name = str(raw.get("package_name") or "com.android.shell")
-        activity_name = str(raw.get("activity_name") or "MainActivity")
+        package_name = str(raw.get("package_name") or "")
+        activity_name = str(raw.get("activity_name") or "")
         # 缺少字段不表示用户已结束接管；清除状态必须由端侧明确上报。
         takeover = session.takeover_reason if session is not None else None
         if "takeover_reason" in raw:

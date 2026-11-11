@@ -423,3 +423,23 @@ async def test_missing_snapshot_ref_is_unknown_after_one_sent_request(op: str) -
                 await bridge.perform_action(None, {"action": "tap", "x": 10, "y": 10})
         assert caught.value.outcome == "unknown"
         assert len(peer.requests) == 1 and peer.requests[0]["op"] == op
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", [{}, {"package_name": None, "activity_name": None},
+                                      {"package_name": "", "activity_name": ""}])
+async def test_unknown_foreground_identity_is_not_replaced_with_shell_defaults(identity: dict) -> None:
+    """真实传输中的缺失、null、空值都保持未知，不伪造可启动应用身份。"""
+    async with peer_connection("screen", {"nodes": [], **identity}) as (bridge, peer):
+        snapshot = await bridge.observe(None)
+        assert snapshot.package_name == snapshot.activity_name == ""
+        assert "Foreground: unknown/unknown" in format_screen_snapshot(snapshot)
+        assert len(peer.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_known_package_with_unknown_activity_does_not_invent_main_activity() -> None:
+    async with peer_connection("screen", {"package_name": "dev.fixture", "activity_name": "", "nodes": []}) as (bridge, peer):
+        snapshot = await bridge.observe(None)
+        assert snapshot.package_name == "dev.fixture" and snapshot.activity_name == ""
+        assert "Foreground: dev.fixture/unknown" in format_screen_snapshot(snapshot)

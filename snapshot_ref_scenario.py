@@ -126,6 +126,7 @@ async def main() -> None:
         # 3. Returned references are rendered, then sent without rewriting.
         observed = await call("phone_observe", {})
         assert observed.outcome == "success"
+        assert "Foreground: unknown/unknown" in observed.parts[0].value
         first_ref = wire[-1]["request_id"]
         assert f"snapshot_ref={first_ref}" in observed.parts[0].value
         edited = await call("phone_action", {"description": "edit fixture", "action": "type_text",

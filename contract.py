@@ -51,6 +51,7 @@ class PhoneScreenSnapshot:
     """一次端侧观察返回的虚拟屏状态、UI 树与可选 PNG 帧。"""
 
     device_id: str
+    snapshot_ref: str
     display_id: int
     width: int
     height: int

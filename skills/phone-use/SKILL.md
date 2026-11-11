@@ -22,7 +22,7 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
    - 如果只有 1 台手机在线，后续 `phone_observe` / `phone_action` 可以省略 `device_id`；若有多台手机同时在线，必须显式传入目标 `device_id`。
 3. **启动或观察目标应用（`phone_action` / `phone_observe`）**：
    - 后台虚拟屏采用懒创建（`LazyDisplay`）：首次调用 `phone_action(action="launch_app", package_name="...")` 或 `phone_observe` 时自动建屏，纯聊天回合从头到尾不建屏。
-   - 每次 `phone_action` 执行完毕都会自动返回动作后的最新虚拟屏 UI 节点树快照（含每个可交互控件的 `[node_id]`、文本、类名、`bounds` 与 `center` 坐标），无需在每次点击后再单独调一次 `phone_observe`。
+   - 每次 `phone_action` 执行完毕都会自动返回动作后的最新虚拟屏 UI 节点树快照（含 `snapshot_ref` 及每个可交互控件的 `[node_id]`、文本、类名、`bounds` 与 `center` 坐标），无需在每次点击后再单独调一次 `phone_observe`。
 
 ## 2. 核心设计机制与操作准则
 
@@ -34,8 +34,14 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 
 ### 优先使用结构化 UI 树，按需索取截图
 - 默认返回的 `UI Elements` 列表已包含所有可见可交互控件的 `[node_id]`：
-  - 点击已知控件优先传 `node_id`：`phone_action(description="点击搜索按钮", action="tap", node_id=3)`；
+  - 点击已知控件优先传 `node_id`：`phone_action(description="点击搜索按钮", action="tap", node_id=3, snapshot_ref="req-...工具返回的完整引用...")`；
   - 只有在自定义绘制界面（游戏、Canvas、无标签图标）导致节点树缺失时，才将 `include_screenshot=true` 传给 `phone_observe` 或 `phone_action`，结合视觉截图用 `x, y` 坐标点击。
+
+### 快照引用（Shell 0.5.0 / phone-use 0.3.0 起）
+- 节点点击以及 `type_text` / `clear_text` 必须把目标快照的 `snapshot_ref` 原样传回；文字操作省略 `node_id` 时也必填。
+- 每次观察或动作返回新快照后，使用新引用；短 `node_id` 只在所属快照内有效，不能与另一快照的引用混用。
+- 缺少引用不会自动使用最新快照。收到 `PHONE_SNAPSHOT_STALE` 时先重新观察，不能用旧编号直接重试。
+- 坐标点击不使用节点引用；快照引用不保证页面不会异步变化，仍需检查动作结果。
 
 ### 断连与结果丢失
 - 明确报告“排队超时，未发送到端侧”表示本次请求没有执行；先处理占用设备的在途操作，再决定是否重新发起。

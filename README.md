@@ -19,7 +19,7 @@
 
 ## SSE 连接身份与配套版本
 
-`phone-use 0.2.0` 的 Android SSE 通道要求 Akashic Shell **0.4.0 或更新版本**，必须配套升级，不能单边部署。旧版不携带连接身份，迟到的 HTTP 状态会覆盖重连后的新状态。
+`phone-use 0.3.0` 的 Android 通道要求 Akashic Shell **0.5.0 或更新版本**，必须配套升级，不能单边部署。旧版不携带连接身份，迟到的 HTTP 状态会覆盖重连后的新状态。
 
 ```text
 ┌──────────────────────┐  POST hello：supports_connection_id=true  ┌──────────────────────┐
@@ -33,7 +33,7 @@
 - `/api/phone/reply`：ACK、response 和独立 state 都必须携带所属 welcome 的 `connection_id`。缺少、错误或过期身份返回 HTTP 409，不应用状态；合法身份但设备已离线返回 HTTP 404。
 - 重连后旧线程继续使用旧身份，不能给旧状态补上新连接 ID。重复 response 在同一有效连接内仍可确认接收，但不能覆盖已完成或其他请求的状态。
 - WebSocket 帧继续由所属 session 绑定；其 welcome 也提供 `connection_id`，用于可选的 HTTP 回传。
-- `/api/phone/apk` 只提供 `akashic-shell-v0.4.0.apk`。兼容的 release 制品缺席时明确返回 HTTP 404，不回退到仓库中的旧版 APK；debug 构建不等同已发布 release。
+- `/api/phone/apk` 只提供 `akashic-shell-v0.5.0.apk`。兼容的 release 制品缺席时明确返回 HTTP 404，不回退到仓库中的旧版 APK；debug 构建不等同已发布 release。
 
 ## 验证命令
 
@@ -45,3 +45,28 @@ PYTHONPATH=/home/huashen/coding/akashic-agent pytest -q tests/test_phone_monkey.
 # 依赖旧 agent.plugins.bundles API，需适配目标 Core 后才能运行。
 PYTHONPATH=/home/huashen/coding/akashic-agent python3 e2e_scenario.py
 ```
+
+## 节点引用是快照的一部分（破坏性协议升级）
+
+最终屏幕返回 `snapshot_ref`（产生该屏幕的 RPC UUID）；`node_id` 仍是简短整数。
+点击节点、`type_text` 或 `clear_text` 时原样传回所属快照引用，例如：
+
+```json
+{"description":"点击搜索框","action":"tap","node_id":3,"snapshot_ref":"req-0123456789abcdef0123456789abcdef"}
+```
+
+每次观察或动作结果都产生新引用。连接或显示器更换、空树及已开始的 RPC 失败也会使旧节点失效。
+收到 `PHONE_SNAPSHOT_STALE` 后重新观察；缺少引用明确拒绝，工具不自动补上最新值。
+即使不传 `node_id`、向聚焦输入框输入，仍须传 `snapshot_ref`。
+坐标点击不使用缓存节点，不要求引用，也不因此获得页面稳定性保证。
+新插件在注册前要求 Shell hello 声明 `supports_snapshot_ref=true`；旧 Shell 必须升级。
+旧插件会丢弃屏幕引用，新 Shell 会拒绝它的节点操作；两端必须配套升级。
+
+真实 Core 工具链协议回归（临时 workspace、真实注册表/账本/UDS，协议 peer 非真机）：
+
+```sh
+AKASHIC_CORE_ROOT=/path/to/core /path/to/python snapshot_ref_scenario.py
+```
+
+覆盖 schema 暴露引用、缺少引用不发送、观察和动作结果完整展示引用、动作原样传回引用；
+它不验证 Android 的节点归属检查，也不是固定预算模型成功率。

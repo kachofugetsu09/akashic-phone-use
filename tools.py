@@ -65,6 +65,10 @@ class PhoneActionInput(BaseModel):
     device_id: str | None = Field(default=None, min_length=1, max_length=128)
     package_name: str | None = Field(default=None, min_length=1, max_length=256)
     node_id: int | None = Field(default=None, ge=1)
+    snapshot_ref: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        description="节点所属快照的 snapshot_ref，原样复制最近一次工具返回值；节点点击及 type_text/clear_text 必填，不能从旧快照借用。",
+    )
     x: int | None = Field(default=None, ge=0, le=10_000)
     y: int | None = Field(default=None, ge=0, le=10_000)
     end_x: int | None = Field(default=None, ge=0, le=10_000)
@@ -92,6 +96,8 @@ class PhoneActionInput(BaseModel):
     @model_validator(mode="after")
     def _validate_action_fields(self) -> PhoneActionInput:
         act = self.action
+        if (act in ("type_text", "clear_text") or (act == "tap" and self.node_id is not None)) and not self.snapshot_ref:
+            raise ValueError("节点操作必须提供所属快照的 snapshot_ref；请先观察，不自动使用最新引用")
         if act == "launch_app" and not self.package_name:
             raise ValueError("launch_app 必须提供 package_name")
         if act == "tap" and self.node_id is None and (self.x is None or self.y is None):

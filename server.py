@@ -23,7 +23,7 @@ from .bridge import PhoneBridge, PhoneNodeError, _NodeSession
 
 logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = 10.0
-MIN_SHELL_VERSION = "0.4.0"
+MIN_SHELL_VERSION = "0.5.0"
 
 
 class PhoneListenerServer(uvicorn.Server):
@@ -224,6 +224,9 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
             hello = json.loads(first_raw)
             if not isinstance(hello, dict) or hello.get("type") != "hello":
                 await websocket.close(code=1008, reason="首帧必须是 hello")
+                return
+            if hello.get("supports_snapshot_ref") is not True:
+                await websocket.close(code=1008, reason="Upgrade Akashic Shell to 0.5.0: snapshot_ref required")
                 return
             session = await bridge.register_node(
                 cast(dict[str, object], hello),

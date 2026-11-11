@@ -67,12 +67,12 @@ class _SimulatedAndroidNode:
 
         session = await self.bridge.register_node(
             {
-                "type": "hello",
+                "type": "hello", "supports_snapshot_ref": True,
                 "device_id": self.device_id,
                 "device_name": f"Phone-{self.device_id}",
                 "model": "Pixel 9",
                 "sdk_int": 35,
-                "shell_version": "0.3.0",
+                "shell_version": "0.5.0",
                 "display_mode": "virtual_display",
                 "virtual_display_id": self.display_id,
                 "own_focus": True,
@@ -174,6 +174,7 @@ class _SimulatedAndroidNode:
             },
         ]
         screen: dict[str, object] = {
+            "snapshot_ref": req_id,
             "display_id": self.display_id,
             "width": 1080,
             "height": 2400,

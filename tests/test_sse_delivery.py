@@ -96,7 +96,7 @@ class SsePeer:
 async def sse_peer(client, device_id="sse-peer"):
     """从 welcome 取得本连接 ID，不从全局当前连接替旧线程补 ID。"""
     async with client.stream("POST", "/api/phone/stream", json={
-        "type": "hello", "device_id": device_id, "supports_ack": True,
+        "type": "hello", "supports_snapshot_ref": True, "device_id": device_id, "supports_ack": True,
         "supports_connection_id": True, "takeover_reason": None,
     }) as response:
         assert response.status_code == 200
@@ -136,7 +136,7 @@ async def test_legacy_client_and_missing_identity_fail_without_replacing_session
                 "type": "hello", "device_id": "sse-peer", "supports_ack": True
             })
             assert rejected.status_code == 400
-            assert "0.4.0" in rejected.json()["detail"]
+            assert "0.5.0" in rejected.json()["detail"]
             assert bridge._sessions["sse-peer"].connection_id == active.connection_id
             missing = await client.post("/api/phone/reply", json={
                 "type": "state", "device_id": "sse-peer", "takeover_reason": "legacy"
@@ -156,7 +156,7 @@ async def test_apk_download_does_not_fall_back_to_incompatible_binary(tmp_path, 
     async with phone_server() as (_, client):
         response = await client.get("/api/phone/apk")
         assert response.status_code == 404
-        assert "0.4.0" in response.json()["detail"]
+        assert "0.5.0" in response.json()["detail"]
         assert "release APK 尚未打包" in response.json()["detail"]
 
 
@@ -271,7 +271,7 @@ async def test_sse_disconnect_before_headers_does_not_leak_registered_session() 
 
     async with phone_server(delay_headers) as (bridge, client):
         request = client.build_request("POST", "/api/phone/stream", json={
-            "type": "hello", "device_id": "sse-peer", "supports_connection_id": True
+            "type": "hello", "supports_snapshot_ref": True, "device_id": "sse-peer", "supports_connection_id": True
         })
         connecting = asyncio.create_task(client.send(request, stream=True))
         try:
@@ -307,7 +307,7 @@ async def test_websocket_write_backpressure_respects_rpc_deadline() -> None:
     async with phone_server(delay_request_write) as (bridge, client):
         url = str(client.base_url).replace("http://", "ws://").rstrip("/") + "/api/phone/ws"
         async with connect(url) as ws:
-            await ws.send(json.dumps({"type": "hello", "device_id": "ws-peer", "supports_ack": True}))
+            await ws.send(json.dumps({"type": "hello", "supports_snapshot_ref": True, "device_id": "ws-peer", "supports_ack": True}))
             assert json.loads(await ws.recv())["type"] == "welcome"
 
             async def reply():
@@ -394,7 +394,7 @@ async def test_sse_transport_timeout_never_claims_definitely_unsent(stage) -> No
 
     async with phone_server(delay_stream) as (bridge, client):
         request = client.build_request("POST", "/api/phone/stream", json={
-            "type": "hello", "device_id": "sse-peer", "supports_ack": True,
+            "type": "hello", "supports_snapshot_ref": True, "device_id": "sse-peer", "supports_ack": True,
             "supports_connection_id": True,
         })
         connecting = asyncio.create_task(client.send(request, stream=True))
@@ -445,7 +445,7 @@ async def test_unacked_websocket_close_backpressure_does_not_hold_rpc_or_shutdow
     async with phone_server(block_close) as (bridge, client):
         url = str(client.base_url).replace("http://", "ws://").rstrip("/") + "/api/phone/ws"
         async with connect(url) as ws:
-            await ws.send(json.dumps({"type": "hello", "device_id": "sse-peer", "supports_ack": True}))
+            await ws.send(json.dumps({"type": "hello", "supports_snapshot_ref": True, "device_id": "sse-peer", "supports_ack": True}))
             await ws.recv()
             pending = asyncio.create_task(bridge.rpc(None, "action", {"action": "tap"}, timeout_ms=100))
             await ws.recv()  # 请求到达，但端侧不回 ACK。
@@ -500,10 +500,10 @@ async def test_latest_sse_registration_wins_while_previous_websocket_close_is_bl
     async with phone_server(block_old_close) as (bridge, client):
         url = str(client.base_url).replace("http://", "ws://").rstrip("/") + "/api/phone/ws"
         async with connect(url) as old:
-            await old.send(json.dumps({"type": "hello", "device_id": "sse-peer"}))
+            await old.send(json.dumps({"type": "hello", "supports_snapshot_ref": True, "device_id": "sse-peer"}))
             await old.recv()
             request = client.build_request("POST", "/api/phone/stream", json={
-                "type": "hello", "device_id": "sse-peer", "device_name": "first",
+                "type": "hello", "supports_snapshot_ref": True, "device_id": "sse-peer", "device_name": "first",
                 "supports_ack": True, "supports_connection_id": True,
             })
             first = asyncio.create_task(client.send(request, stream=True))
@@ -541,3 +541,17 @@ async def test_latest_sse_registration_wins_while_previous_websocket_close_is_bl
                 result = (await asyncio.gather(first, return_exceptions=True))[0]
                 if isinstance(result, httpx.Response):
                     await result.aclose()
+
+
+@pytest.mark.asyncio
+async def test_missing_snapshot_capability_does_not_replace_current_connection() -> None:
+    """旧 Shell 注册在替换连接前明确失败，不能踢掉已配套升级的设备。"""
+    async with phone_server() as (bridge, client):
+        async with sse_peer(client) as active:
+            rejected = await client.post("/api/phone/stream", json={
+                "type": "hello", "device_id": "sse-peer", "supports_connection_id": True,
+            })
+            assert rejected.status_code == 400
+            assert "snapshot_ref" in rejected.json()["detail"]
+            assert "0.5.0" in rejected.json()["detail"]
+            assert bridge._sessions["sse-peer"].connection_id == active.connection_id

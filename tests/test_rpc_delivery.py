@@ -70,7 +70,7 @@ class ProtocolPeer:
         while True:
             async with connect(url) as ws:
                 await ws.send(json.dumps({
-                    "type": "hello", "device_id": "fault-peer", "supports_ack": True
+                    "type": "hello", "supports_snapshot_ref": True, "device_id": "fault-peer", "supports_ack": True
                 }))
                 await ws.recv()
                 await self.connections.put(ws)
@@ -102,6 +102,8 @@ class ProtocolPeer:
                         elif action == "resume_from_user":
                             self.screen["takeover_reason"] = None
                             self.screen["pip_state"] = "running"
+                        if self.fault != "screen_without_ref":
+                            self.screen["snapshot_ref"] = request_id
                         result = (
                             {"message": "peer received action", "screen": dict(self.screen)}
                             if frame["op"] == "action" else dict(self.screen)
@@ -373,7 +375,7 @@ async def test_starlette_send_disconnect_becomes_phone_error() -> None:
         await asyncio.wait_for(server.ready.wait(), 2)
         port = listener.getsockname()[1]
         async with connect(f"ws://127.0.0.1:{port}/api/phone/ws") as ws:
-            await ws.send(json.dumps({"type": "hello", "device_id": "asgi-peer", "supports_ack": True}))
+            await ws.send(json.dumps({"type": "hello", "supports_snapshot_ref": True, "device_id": "asgi-peer", "supports_ack": True}))
             assert json.loads(await ws.recv())["type"] == "welcome"
             with pytest.raises(PhoneNodeError, match="结果不确定，可能已执行"):
                 await bridge.rpc(None, "action", {"action": "tap"})
@@ -386,3 +388,32 @@ async def test_starlette_send_disconnect_becomes_phone_error() -> None:
         await asyncio.wait_for(running, 3)
         listener.close()
         await bridge.close_all()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_ref_survives_transport_decode_and_render_without_action_autofill() -> None:
+    """同一短编号的新旧快照在真实 WebSocket 上保留不同引用。"""
+    screen = {"nodes": [{"node_id": 1, "text": "old", "bounds": [0, 0, 20, 20]}]}
+    async with peer_connection("screen", screen) as (bridge, peer):
+        first = await bridge.observe(None)
+        screen["nodes"][0]["text"] = "new"
+        second = await bridge.observe(None)
+        assert first.snapshot_ref == peer.requests[0]["request_id"]
+        assert second.snapshot_ref == peer.requests[1]["request_id"]
+        assert first.snapshot_ref != second.snapshot_ref
+        assert first.nodes[0].node_id == second.nodes[0].node_id == 1
+        assert f"snapshot_ref={second.snapshot_ref}" in format_screen_snapshot(second)
+        _, after = await bridge.perform_action(None, {
+            "action": "tap", "node_id": 1, "snapshot_ref": first.snapshot_ref,
+        })
+        # Bridge preserves the caller's reference; only Android owns acceptance of stale nodes.
+        assert peer.requests[-1]["payload"]["snapshot_ref"] == first.snapshot_ref
+        assert after is not None and after.snapshot_ref == peer.requests[-1]["request_id"]
+
+
+@pytest.mark.asyncio
+async def test_missing_snapshot_ref_is_upgrade_error_not_invented_latest_ref() -> None:
+    async with peer_connection("screen_without_ref", {"nodes": []}) as (bridge, peer):
+        with pytest.raises(PhoneNodeError, match="snapshot_ref.*0.5.0"):
+            await bridge.observe(None)
+        assert len(peer.requests) == 1

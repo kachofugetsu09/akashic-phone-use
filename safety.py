@@ -48,6 +48,7 @@ def parse_ui_nodes(raw_nodes: object) -> tuple[PhoneUiNode, ...]:
 def format_screen_snapshot(snapshot: PhoneScreenSnapshot) -> str:
     """将后台虚拟屏快照渲染为高信噪比、省 Token 的文本表示。"""
     header = [
+        f"Snapshot: snapshot_ref={snapshot.snapshot_ref}",
         f"Device: {snapshot.device_id} | VirtualDisplay: #{snapshot.display_id} ({snapshot.width}x{snapshot.height} rot={snapshot.rotation})",
         f"Foreground: {snapshot.package_name}/{snapshot.activity_name} | PiP: {snapshot.pip_state} | AudioMuted: {snapshot.audio_muted}",
     ]

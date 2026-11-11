@@ -124,6 +124,8 @@ class PhoneBridge:
         device_id = str(hello.get("device_id") or "").strip()
         if not device_id or len(device_id) > 128:
             raise ValueError("端侧注册缺少合法的 device_id")
+        if hello.get("supports_snapshot_ref") is not True:
+            raise ValueError("节点协议需要 snapshot_ref，请升级 Akashic Shell 至 0.5.0 或更新版本")
         previous = self._sessions.get(device_id)
         if previous is not None and not previous.closed:
             # deadline=now 只同步失效并跟踪 close，不在此让出；后来的注册始终获胜。
@@ -432,6 +434,9 @@ class PhoneBridge:
         )
 
     def _decode_snapshot(self, device_id: str, raw: Mapping[str, object]) -> PhoneScreenSnapshot:
+        snapshot_ref = raw.get("snapshot_ref")
+        if not isinstance(snapshot_ref, str) or not snapshot_ref or len(snapshot_ref) > 128:
+            raise PhoneNodeError("端侧快照缺少合法 snapshot_ref，请升级 Akashic Shell 至 0.5.0 并重新观察")
         session = self._sessions.get(device_id)
         nodes = parse_ui_nodes(raw.get("nodes"))
         package_name = str(raw.get("package_name") or "com.android.shell")
@@ -457,6 +462,7 @@ class PhoneBridge:
             png_bytes = base64.b64decode(raw_image, validate=True)
         return PhoneScreenSnapshot(
             device_id=device_id,
+            snapshot_ref=snapshot_ref,
             display_id=int(
                 raw.get("display_id")
                 if isinstance(raw.get("display_id"), int)

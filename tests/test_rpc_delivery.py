@@ -175,10 +175,11 @@ async def test_result_loss_reports_unknown_outcome(fault) -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_failure_is_not_unknown_outcome() -> None:
+async def test_remote_failure_keeps_error_text_and_unknown_effect() -> None:
     async with peer_connection("rejected") as (bridge, peer):
-        with pytest.raises(PhoneNodeError, match="^STALE_NODE$"):
+        with pytest.raises(PhoneNodeError, match="^STALE_NODE$") as caught:
             await bridge.rpc(None, "action", {"action": "tap"})
+        assert caught.value.outcome == "unknown"
         assert len(peer.requests) == 1
 
 

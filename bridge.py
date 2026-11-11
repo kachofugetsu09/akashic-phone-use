@@ -249,7 +249,7 @@ class PhoneBridge:
         *,
         timeout_ms: int = 30_000,
     ) -> dict[str, object]:
-        """排队与执行共享截止时间，过期请求不再发往端侧。"""
+        """排队等待受调用期限约束，过期请求不再发往端侧。"""
         target_id = self.resolve_device_id(device_id)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.1, timeout_ms / 1000.0)

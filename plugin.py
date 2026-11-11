@@ -322,7 +322,7 @@ async def apply(ctx: Context) -> None:
         name="phone_action",
         description=(
             "在手机端后台虚拟屏幕（VirtualDisplay）上执行单步操作：启动应用（launch_app）、点击节点或坐标（tap）、"
-            "输入文字（type_text，支持静默剪贴板粘贴并自动还原）、滚动（scroll）、滑动（swipe）、按键（press_key/back）、"
+            "输入文字（type_text，需检查返回结果与字段内容）、滚动（scroll）、滑动（swipe）、按键（press_key/back）、"
             "打开链接（open_link）、分享文本（share_text）、按用户要求移交手机主屏幕（hand_to_user）"
             "以及用户完成后收回后台虚拟屏幕（resume_from_user）。每次动作后返回更新后的虚拟屏快照。"
         ),

@@ -14,7 +14,8 @@
    - 在用户授权范围内操作，不因为页面包含密码、验证码或支付文字而强制暂停。只有明确的 `takeover_reason` 才阻止普通动作，保留 `hand_to_user` / `resume_from_user` 协议；省略接管字段不会自动解除已确认接管。
    - 设备报告 `secure_window` 时如实提示 `FLAG_SECURE`、截图可能受限，不将其当作接管指令。Android 的截图、输入和认证权限仍然有效，工具不绕过这些限制，也不保证特定应用或交易可执行。
 4. **Turn 闭合自动收尾**：
-   - 跟随 `MESSAGE_CATALOG` 与 `TURN_PROJECTION`，当源 Turn 闭合时自动向手机端发送 `finish` 释放虚拟屏、恢复静音与剪贴板，并将 `OWNER_STATE` 的 `phone-use:*` 记录收敛至 `ended`。
+   - 跟随 `MESSAGE_CATALOG` 与 `TURN_PROJECTION`，当源 Turn 闭合时自动向手机端发送 `finish` 请求释放虚拟屏，并记录 `OWNER_STATE` 的 `phone-use:*` 收尾状态。
+   - 收尾不保证应用进程、最近任务或音频已停止。当前 Shell 没有自动静音或保存并恢复原剪贴板的实现，不应向模型承诺这些能力。
 
 ## SSE 连接身份与配套版本
 

@@ -56,7 +56,7 @@ class PhoneActionInput(BaseModel):
     action: PhoneActionKind = Field(
         description=(
             "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 node_id 或 x/y 点击）、"
-            "type_text（向输入框或聚焦控件输入文本，支持静默剪贴板粘贴并自动还原）、"
+            "type_text（向输入框输入文本，需检查返回结果与字段内容）、"
             "clear_text、scroll（up/down/left/right）、swipe、press_key、back、"
             "open_link、share_text、wait、hand_to_user（按用户要求将应用移交手机主屏幕）、"
             "resume_from_user（用户完成主屏幕操作后收回后台虚拟屏继续）。"
@@ -81,11 +81,11 @@ class PhoneActionInput(BaseModel):
     )
     keep_packages: list[str] = Field(
         default_factory=list,
-        description="任务收尾时保留在系统后台最近任务中的应用包名列表。",
+        description="向端侧请求在收尾时保留的应用包名；是否支持取决于端侧，不保证最近任务状态。",
     )
     close_packages: list[str] = Field(
         default_factory=list,
-        description="任务收尾时关闭并停止发声的应用包名列表。",
+        description="向端侧请求在收尾时关闭的应用包名；是否支持取决于端侧，不保证进程或音频已停止。",
     )
     timeout_ms: int = Field(default=30_000, ge=100, le=110_000)
 

@@ -29,7 +29,8 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 ### 后台虚拟屏与主屏隔离
 - **焦点隔离**：端侧请求 `FLAG_TRUSTED | FLAG_OWN_DISPLAY_GROUP | FLAG_ALWAYS_UNLOCKED | FLAG_OWN_FOCUS | FLAG_STEAL_TOP_FOCUS_DISABLED` 与 `DISPLAY_IME_POLICY_LOCAL`；这些配置不替代对当前设备焦点行为的验证。
 - **主屏占用避让（`START_IN_USE_ON_MAIN`）**：如果用户此时正在主屏幕前台使用某个 App（非 `Akashic Shell`），端侧拒绝把该 App 强行抽到后台虚拟屏。收到占用提示时，礼貌询问用户或等用户切回聊天界面后再操作。
-- **后台自动静音与静默粘贴**：后台虚拟屏打开音视频应用时自动通过 `appops PLAY_AUDIO ignore` 静音；`type_text` 遇到非标准输入框时通过 `shell` 剪贴板附带 `SUPPRESS_CLIPBOARD_OVERLAY` 与 `EXTRA_IS_SENSITIVE` 粘贴并立即还原用户原剪贴板。
+- **音频状态**：后台虚拟屏不等于独立音频环境。当前 Shell 没有自动静音实现；旧端侧还可能固定报告 `audio_muted=true`，不能据此断言用户听不到声音或音频焦点未受影响。
+- **输入结果**：`type_text` 后检查返回的字段内容；自定义编辑器可能不支持输入。当前 Shell 没有保存并恢复原剪贴板的实现，不承诺静默粘贴或原剪贴板不变。输入失败或结果不明时，先观察，不直接重复输入，也不自行切换到主屏。
 
 ### 优先使用结构化 UI 树，按需索取截图
 - 默认返回的 `UI Elements` 列表已包含所有可见可交互控件的 `[node_id]`：
@@ -58,7 +59,8 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 - **收回后台继续（`resume_from_user`）**：用户确认手动处理完成后，调用 `phone_action(description="收回后台虚拟屏继续", action="resume_from_user")`，检查接管状态已解除后继续。
 
 ### Turn 结束自动收尾
-- 当前对话 Turn 闭合（`complete` / `quiet` / `abandoned`）时，`phone-use` 插件的后台 follower 会自动向手机端发送 `finishDisplay`，释放虚拟屏幕、恢复被静音的应用并还原剪贴板；也可以在最后一步 `phone_action` 中通过 `keep_packages` / `close_packages` 指定哪些应用保留在系统最近任务、哪些直接关闭。
+- 当前对话 Turn 闭合（`complete` / `quiet` / `abandoned`）时，插件的后台 follower 会向手机端发送 `finish` 请求释放虚拟屏幕。
+- 最后一步的 `keep_packages` / `close_packages` 会作为收尾请求传给端侧。当前 Shell 只释放虚拟屏并回显包名，回显不证明应用已保留、关闭或停止发声；不要向用户宣称这些效果已完成。收尾也不包含恢复静音或原剪贴板。
 
 ## 3. 常见包名速查
 

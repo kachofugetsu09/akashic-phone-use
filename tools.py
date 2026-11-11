@@ -56,7 +56,7 @@ class PhoneActionInput(BaseModel):
     action: PhoneActionKind = Field(
         description=(
             "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 node_id 或 x/y 点击）、"
-            "type_text（向输入框输入文本，需检查返回结果与字段内容）、"
+            "type_text（设置输入框全文，覆盖原有内容，无需先清空；需检查返回结果与字段内容）、"
             "clear_text、scroll（up/down/left/right）、swipe、press_key、back、"
             "open_link、share_text、wait、hand_to_user（按用户要求将应用移交手机主屏幕）、"
             "resume_from_user（用户完成主屏幕操作后收回后台虚拟屏继续）。"

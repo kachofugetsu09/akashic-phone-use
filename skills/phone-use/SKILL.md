@@ -30,7 +30,7 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 - **焦点隔离**：端侧请求 `FLAG_TRUSTED | FLAG_OWN_DISPLAY_GROUP | FLAG_ALWAYS_UNLOCKED | FLAG_OWN_FOCUS | FLAG_STEAL_TOP_FOCUS_DISABLED` 与 `DISPLAY_IME_POLICY_LOCAL`；这些配置不替代对当前设备焦点行为的验证。
 - **主屏占用避让（`START_IN_USE_ON_MAIN`）**：如果用户此时正在主屏幕前台使用某个 App（非 `Akashic Shell`），端侧拒绝把该 App 强行抽到后台虚拟屏。收到占用提示时，礼貌询问用户或等用户切回聊天界面后再操作。
 - **音频状态**：后台虚拟屏不等于独立音频环境。当前 Shell 没有自动静音实现；旧端侧还可能固定报告 `audio_muted=true`，不能据此断言用户听不到声音或音频焦点未受影响。
-- **输入结果**：`type_text` 后检查返回的字段内容；自定义编辑器可能不支持输入。当前 Shell 没有保存并恢复原剪贴板的实现，不承诺静默粘贴或原剪贴板不变。输入失败或结果不明时，先观察，不直接重复输入，也不自行切换到主屏。
+- **输入结果**：`type_text` 设置输入框全文，会覆盖原有内容；替换文本时无需先调用 `clear_text`。追加内容需先读出现有全文再组成目标文本；只需清空时使用 `clear_text`。操作后检查返回的字段内容；自定义编辑器可能不支持输入。当前 Shell 没有保存并恢复原剪贴板的实现，不承诺静默粘贴或原剪贴板不变。输入失败或结果不明时，先观察，不直接重复输入，也不自行切换到主屏。
 
 ### 优先使用结构化 UI 树，按需索取截图
 - 默认返回的 `UI Elements` 列表已包含所有可见可交互控件的 `[node_id]`：

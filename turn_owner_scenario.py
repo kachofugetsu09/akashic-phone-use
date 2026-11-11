@@ -15,7 +15,7 @@ os.environ.update(AKASHIC_PLUGIN_DISTRIBUTION='', AKASHIC_EXECUTION_MODE='local'
 from agent.plugin_composition import ServiceKey
 from agent.plugins.manager import PluginManager
 from tests.fixtures.plugin_workspace import initialize_plugin_workspace
-from plugins.ledger.contract import BINDINGS, MESSAGE_CATALOG, OWNER_STATE, Input, Output, ContentPart
+from plugins.ledger.contract import BINDINGS, MESSAGE_CATALOG, OWNER_STATE, Input, Output, ContentPart, json_value
 from plugins.turn_projection.contract import TURN_PROJECTION
 from core.common.unix_socket import socket_alias_path
 from websockets.asyncio.client import unix_connect
@@ -147,6 +147,25 @@ async def main():
         assert not any(req['op']=='finish' for req in peer.requests)
         assert state.read('phone-use:A').value['cleanup_outcome']=='not_sent'
         print('SHARED_DEVICE_PROTECTED',json.dumps(result,ensure_ascii=False),flush=True)
+        # Old owner selectors are persisted fixture data, not an implemented cleanup capability.
+        legacy=await Peer(path,'legacy-phone').start(); peers.append(legacy)
+        await begin('audit:L','L','legacy-phone','L')
+        original=state.read('phone-use:L')
+        assert 'keep_packages' not in original.value and 'close_packages' not in original.value
+        selectors={'keep_packages':['dev.fixture.keep'], 'close_packages':['dev.fixture.close']}
+        async with ctx.runtime_scope():
+            await state.transact_async(lambda tx: tx.save('phone-use:L', {**original.value, **selectors},
+                expected_version=original.version))
+        await close_turn('audit:L','L')
+        await wait_until(lambda:phase('L')=='ended')
+        finished=state.read('phone-use:L').value
+        assert all(json_value(finished[k])==v for k,v in selectors.items())
+        requests=[req for req in legacy.requests if req['op']=='finish']
+        assert len(requests)==1 and requests[0]['payload']=={'reason':'turn_ended'} and legacy.display is None
+        assert finished['cleanup_outcome']=='confirmed'
+        result['legacy_selectors_ignored_without_rewriting']={'wire_finish':requests[0],
+            'legacy_lists_preserved':True,'outcome':finished['cleanup_outcome']}
+        print('LEGACY_SELECTORS_RELEASED',json.dumps(result['legacy_selectors_ignored_without_rewriting']),flush=True)
         # Reconnect alone must recover a known-unsent finish, with no new Message.
         off=await Peer(path,'offline-phone').start(); peers.append(off)
         await begin('audit:C','C','offline-phone','C')

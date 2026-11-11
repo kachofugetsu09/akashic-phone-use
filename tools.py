@@ -83,14 +83,6 @@ class PhoneActionInput(BaseModel):
         default=False,
         description="动作执行后是否附带最新一帧后台虚拟屏 PNG 截图。",
     )
-    keep_packages: list[str] = Field(
-        default_factory=list,
-        description="向端侧请求在收尾时保留的应用包名；是否支持取决于端侧，不保证最近任务状态。",
-    )
-    close_packages: list[str] = Field(
-        default_factory=list,
-        description="向端侧请求在收尾时关闭的应用包名；是否支持取决于端侧，不保证进程或音频已停止。",
-    )
     timeout_ms: int = Field(default=30_000, ge=100, le=110_000)
 
     @model_validator(mode="after")

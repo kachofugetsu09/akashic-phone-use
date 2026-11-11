@@ -314,7 +314,7 @@ async def apply(ctx):
                         "type": "response",
                         "request_id": req_id,
                         "ok": True,
-                        "result": {"kept": payload.get("keep", []), "closed": payload.get("close", [])},
+                        "result": {"kept": [], "closed": []},
                         "state": {"virtual_display_id": None, "pip_state": "done"},
                     },
                 )

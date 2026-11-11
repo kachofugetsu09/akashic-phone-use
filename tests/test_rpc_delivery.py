@@ -443,3 +443,13 @@ async def test_known_package_with_unknown_activity_does_not_invent_main_activity
         snapshot = await bridge.observe(None)
         assert snapshot.package_name == "dev.fixture" and snapshot.activity_name == ""
         assert "Foreground: dev.fixture/unknown" in format_screen_snapshot(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_finish_sends_whole_display_cleanup_without_package_selectors() -> None:
+    """真实传输上的自动收尾协议不再请求未实现的按包效果。"""
+    async with peer_connection("ok") as (bridge, peer):
+        await bridge.finish_display(None)
+        assert len(peer.requests) == 1
+        assert peer.requests[0]["op"] == "finish"
+        assert peer.requests[0]["payload"] == {"reason": "completed"}

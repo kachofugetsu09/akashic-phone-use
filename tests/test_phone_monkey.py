@@ -114,9 +114,7 @@ class _SimulatedAndroidNode:
             self.pip_state = "running"
 
         if op == "finish":
-            keep = [str(p) for p in cast(list[object], payload.get("keep", []))]
-            close = [str(p) for p in cast(list[object], payload.get("close", []))]
-            self.active_packages = [p for p in self.active_packages if p in keep and p not in close]
+            self.active_packages = []
             self.display_id = None
             self.pip_state = "done"
             self.takeover_reason = None
@@ -128,7 +126,7 @@ class _SimulatedAndroidNode:
                     "type": "response",
                     "request_id": req_id,
                     "ok": True,
-                    "result": {"kept": keep, "closed": close},
+                    "result": {"kept": [], "closed": []},
                     "state": {
                         "virtual_display_id": None,
                         "pip_state": "done",
@@ -314,7 +312,7 @@ async def test_monkey_phone_bridge_invariants(seed: int) -> None:
                 assert snap.pip_state == "running"
         elif op == "finish":
             if dev_id in online_ids:
-                res = await bridge.finish_display(dev_id, keep_packages=("com.tencent.mm",))
+                res = await bridge.finish_display(dev_id)
                 assert "kept" in res
         elif op == "drop_during_rpc":
             if dev_id in online_ids:

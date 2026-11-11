@@ -15,7 +15,7 @@
    - 设备报告 `secure_window` 时如实提示 `FLAG_SECURE`、截图可能受限，不将其当作接管指令。Android 的截图、输入和认证权限仍然有效，工具不绕过这些限制，也不保证特定应用或交易可执行。
 4. **Turn 闭合自动收尾**：
    - 跟随 `MESSAGE_CATALOG` 与 `TURN_PROJECTION`，当源 Turn 闭合时自动向手机端发送 `finish` 请求释放虚拟屏，并记录 `OWNER_STATE` 的 `phone-use:*` 收尾状态。
-   - 收尾不保证应用进程、最近任务或音频已停止。当前 Shell 没有自动静音或保存并恢复原剪贴板的实现，不应向模型承诺这些能力。
+   - 工具不支持按包保留/关闭；`keep_packages` / `close_packages` 会明确报参数错误。收尾不保证应用进程、最近任务或音频已停止。当前 Shell 没有自动静音或保存并恢复原剪贴板的实现，不应向模型承诺这些能力。
 
 ## SSE 连接身份与配套版本
 
@@ -100,3 +100,11 @@ AKASHIC_CORE_ROOT=/path/to/akashic-agent python3 turn_owner_scenario.py
 都解码为空串，工具展示 `unknown`，不会补造 `com.android.shell/MainActivity`。
 包名已知但 Activity 未知时分别显示。Shell 也需配套停止使用跨屏历史事件和默认包名；
 新插件无法辨认旧 Shell 已经填入的假名称。该字段是观察结果，不是动作的目标应用参数。
+
+## 收尾只释放整块后台显示器
+
+agent 没有 public finish 动作；Turn 闭合后自动发出的 finish 只释放整个 VD。
+新调用不接受、转发或记录 keep/close 包选择。旧 v1 owner 回执中的列表保持原样，
+只在既有回执读取边界忽略这些无实现的选择，不妨碍自动 release，也不改写历史列表。
+端侧兼容接收旧 finish payload，但 kept/closed 只返回实际空数组，不把请求回显当成效果。
+最近任务、进程和音频是否停止仍不受保证。

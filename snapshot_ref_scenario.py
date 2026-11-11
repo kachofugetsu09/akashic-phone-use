@@ -70,6 +70,7 @@ async def main() -> None:
         refs = root.context.require(ALL_TOOLS)()
         action_ref = refs.select("phone_action")
         assert "snapshot_ref" in action_ref.description["parameters"]["properties"]
+        assert not {"keep_packages", "close_packages"} & action_ref.description["parameters"]["properties"].keys()
         async with ctx.runtime_scope():
             bindings = ctx.require(BINDINGS)
             tools = ctx.require(TOOLS)
@@ -122,6 +123,10 @@ async def main() -> None:
         for args in ({"action": "tap", "node_id": 1}, {"action": "type_text", "text": "x"}, {"action": "clear_text"}):
             refusal = await call("phone_action", {"description": "missing reference", **args})
             assert isinstance(refusal, str) and "snapshot_ref" in refusal
+        for selector in ("keep_packages", "close_packages"):
+            refusal = await call("phone_action", {"description": "unsupported selection", "action": "tap", "x": 10, "y": 10,
+                                                  selector: ["dev.fixture"]})
+            assert isinstance(refusal, str) and selector in refusal and "extra_forbidden" in refusal
         assert not wire
         # 3. Returned references are rendered, then sent without rewriting.
         observed = await call("phone_observe", {})
@@ -146,7 +151,7 @@ async def main() -> None:
         unknown = await call("phone_action", {"description": "missing response reference", "action": "tap", "x": 10, "y": 10})
         assert unknown.outcome == "error" and "结果不确定，可能已执行" in unknown.parts[0].value
         assert len(wire) == before + 1
-        result = {"ok": True, "missing_response_ref_unknown_no_retry": True, "missing_ref_not_sent": True, "ref_rendered_and_forwarded": True,
+        result = {"ok": True, "unsupported_selectors_not_sent": True, "missing_response_ref_unknown_no_retry": True, "missing_ref_not_sent": True, "ref_rendered_and_forwarded": True,
             "coordinate_without_ref": True, "android_owner_checks_tested": False, "wire": wire}
         (base / "result.json").write_text(json.dumps(result, indent=2))
         print("SNAPSHOT_REF_CORE_PASS", base, flush=True)

@@ -66,7 +66,7 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 
 ### Turn 结束自动收尾
 - 当前对话 Turn 闭合（`complete` / `quiet` / `abandoned`）时，插件的后台 follower 会向手机端发送 `finish` 请求释放虚拟屏幕。
-- 最后一步的 `keep_packages` / `close_packages` 会作为收尾请求传给端侧。当前 Shell 只释放虚拟屏并回显包名，回显不证明应用已保留、关闭或停止发声；不要向用户宣称这些效果已完成。收尾也不包含恢复静音或原剪贴板。
+- 自动收尾只释放整个后台虚拟屏。工具不支持 `keep_packages` / `close_packages`，传入会明确报参数错误。收尾不保证应用已保留、关闭、停止发声或从最近任务消失，也不包含恢复静音或原剪贴板。
 
 ## 3. 常见包名速查
 

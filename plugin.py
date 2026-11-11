@@ -98,9 +98,6 @@ class PhoneControl:
         key: str,
         control_binding: str,
         identity: PhoneCallIdentity,
-        *,
-        keep_packages: tuple[str, ...] = (),
-        close_packages: tuple[str, ...] = (),
     ) -> None:
         """在设备发送锁内原子保存调用身份与最新 Turn 使用权。"""
         owner_key = "phone-use:" + key
@@ -112,8 +109,6 @@ class PhoneControl:
             "source": identity.source,
             "turn_input_id": identity.turn_input_id,
             "device_id": identity.device_id,
-            "keep_packages": list(keep_packages),
-            "close_packages": list(close_packages),
         }
         state = self._state()
 
@@ -161,24 +156,17 @@ class PhoneControl:
         requested_device = cast(str | None, arguments.get("device_id"))
         device_id = self.bridge.resolve_device_id(requested_device)
         identity = _parse_call_identity(arguments, device_id)
-        keep = tuple(str(x) for x in cast(list[object], arguments.get("keep_packages", [])) if isinstance(x, str))
-        close = tuple(str(x) for x in cast(list[object], arguments.get("close_packages", [])) if isinstance(x, str))
         payload = {k: v for k, v in arguments.items() if k != "_phone" and v is not None}
         return await self.bridge.perform_action(
             device_id,
             payload,
             timeout_ms=int(arguments.get("timeout_ms", 30_000)),
-            before_send=lambda: self._record_started(
-                key, control_binding, identity, keep_packages=keep, close_packages=close,
-            ),
+            before_send=lambda: self._record_started(key, control_binding, identity),
         )
 
     async def end_turn(
         self,
         identity: PhoneCallIdentity,
-        *,
-        keep_packages: tuple[str, ...] = (),
-        close_packages: tuple[str, ...] = (),
     ) -> PhoneCleanupResult:
         """仅当前 Turn 可收尾；未发送可在连接变化后重访，未知效果不重放。"""
         state = self._state()
@@ -214,8 +202,6 @@ class PhoneControl:
         try:
             _ = await self.bridge.finish_display(
                 identity.device_id,
-                keep_packages=keep_packages,
-                close_packages=close_packages,
                 reason="turn_ended",
                 before_send=check_owner,
             )
@@ -513,15 +499,7 @@ async def _try_end(
         for turn in turns
     ):
         return False
-    keep: list[str] = []
-    close: list[str] = []
-    for _, rec in records:
-        for pkg in cast(list[object], rec.value.get("keep_packages", [])):
-            if isinstance(pkg, str) and pkg not in keep:
-                keep.append(pkg)
-        for pkg in cast(list[object], rec.value.get("close_packages", [])):
-            if isinstance(pkg, str) and pkg not in close:
-                close.append(pkg)
+    # v1 回执可能含旧 keep/close 列表；保留原数据，但它们不再决定整屏收尾。
     binding = cast(str, value["control_binding"])
     device_id = cast(str, value["device_id"])
     bindings = ctx.require(BINDINGS)
@@ -530,7 +508,6 @@ async def _try_end(
             result = await bound.end_turn(
                 PhoneCallIdentity(cast(str, value["session_id"]), cast(str, value["source"]),
                                   cast(str, value["turn_input_id"]), device_id),
-                keep_packages=tuple(keep), close_packages=tuple(close),
             )
     except (KeyError, ValueError) as error:
         await _mark_records(ctx, records, phase="failed", error=f"phone control binding 不可用: {error}")

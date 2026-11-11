@@ -442,8 +442,6 @@ class PhoneBridge:
         self,
         device_id: str | None,
         *,
-        keep_packages: tuple[str, ...] = (),
-        close_packages: tuple[str, ...] = (),
         reason: str = "completed",
         timeout_ms: int = 15_000,
         before_send: Callable[[], Awaitable[None]] | None = None,
@@ -452,11 +450,7 @@ class PhoneBridge:
         return await self.rpc(
             target_id,
             "finish",
-            {
-                "keep": list(keep_packages),
-                "close": list(close_packages),
-                "reason": reason,
-            },
+            {"reason": reason},
             timeout_ms=timeout_ms,
             before_send=before_send,
         )

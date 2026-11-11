@@ -30,6 +30,7 @@ class PhoneNodeError(RuntimeError):
 @dataclass
 class _NodeSession:
     device_id: str
+    connection_id: str
     device_name: str
     model: str
     sdk_int: int
@@ -133,6 +134,7 @@ class PhoneBridge:
         vd_id = int(raw_vd) if isinstance(raw_vd, int) and not isinstance(raw_vd, bool) and raw_vd >= 0 else None
         session = _NodeSession(
             device_id=device_id,
+            connection_id=f"conn-{uuid4().hex}",
             device_name=str(hello.get("device_name") or device_id),
             model=str(hello.get("model") or "Android"),
             sdk_int=int(hello.get("sdk_int") if isinstance(hello.get("sdk_int"), int) else 34),
@@ -190,10 +192,12 @@ class PhoneBridge:
             )
 
     def handle_incoming_for_device(self, device_id: str, frame: Mapping[str, object]) -> bool:
-        """按 device_id 查找活跃节点并投递 HTTP 回传的响应帧或状态帧。"""
+        """只接收当前连接所属的 HTTP 回传，拒绝旧线程迟到的状态。"""
         session = self._sessions.get(device_id)
         if session is None or session.closed:
             return False
+        if frame.get("connection_id") != session.connection_id:
+            raise PhoneNodeError("回传所属连接已过期，请使用当前 welcome 的 connection_id")
         self.handle_incoming(session, frame)
         return True
 

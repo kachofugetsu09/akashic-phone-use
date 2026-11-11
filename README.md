@@ -16,11 +16,29 @@
 4. **Turn 闭合自动收尾**：
    - 跟随 `MESSAGE_CATALOG` 与 `TURN_PROJECTION`，当源 Turn 闭合时自动向手机端发送 `finish` 释放虚拟屏、恢复静音与剪贴板，并将 `OWNER_STATE` 的 `phone-use:*` 记录收敛至 `ended`。
 
+## SSE 连接身份与配套版本
+
+`phone-use 0.2.0` 的 Android SSE 通道要求 Akashic Shell **0.4.0 或更新版本**，必须配套升级，不能单边部署。旧版不携带连接身份，迟到的 HTTP 状态会覆盖重连后的新状态。
+
+```text
+┌──────────────────────┐  POST hello：supports_connection_id=true  ┌──────────────────────┐
+│ Android stream owner ├────────────────────────────────────────►│ PhoneBridge 当前连接 │
+│ 每条线程捕获所属 ID  │◄──────── welcome：connection_id ────────┤ 每次注册生成新 ID    │
+│ ACK / result / state ├── POST reply：携带同一 connection_id ──►│ 只接受当前连接回传   │
+└──────────────────────┘                                        └──────────────────────┘
+```
+
+- `/api/phone/stream`：hello 必须声明 `supports_connection_id=true`；缺少时返回 HTTP 400 升级提示，不替换现有连接。
+- `/api/phone/reply`：ACK、response 和独立 state 都必须携带所属 welcome 的 `connection_id`。缺少、错误或过期身份返回 HTTP 409，不应用状态；合法身份但设备已离线返回 HTTP 404。
+- 重连后旧线程继续使用旧身份，不能给旧状态补上新连接 ID。重复 response 在同一有效连接内仍可确认接收，但不能覆盖已完成或其他请求的状态。
+- WebSocket 帧继续由所属 session 绑定；其 welcome 也提供 `connection_id`，用于可选的 HTTP 回传。
+- `/api/phone/apk` 只提供 `akashic-shell-v0.4.0.apk`。兼容的 release 制品缺席时明确返回 HTTP 404，不回退到仓库中的旧版 APK；debug 构建不等同已发布 release。
+
 ## 验证命令
 
 ```sh
 # 1. 200 seeds Monkey 与真实本地 WebSocket 故障注入（不代表 Android 真机验收）
-PYTHONPATH=/home/huashen/coding/akashic-agent pytest -q tests/test_phone_monkey.py tests/test_rpc_delivery.py
+PYTHONPATH=/home/huashen/coding/akashic-agent pytest -q tests/test_phone_monkey.py tests/test_rpc_delivery.py tests/test_sse_delivery.py
 
 # 2. 历史 Core 脚本（脚本模型与模拟节点，不是真实模型或真机验收）
 # 依赖旧 agent.plugins.bundles API，需适配目标 Core 后才能运行。

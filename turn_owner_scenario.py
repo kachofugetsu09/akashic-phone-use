@@ -56,7 +56,7 @@ class Peer:
         """建立独立真实 WebSocket，并校验服务器握手。"""
         self.ws = await unix_connect(self.path, uri='ws://localhost/api/phone/ws')
         await self.ws.send(json.dumps({'type':'hello', 'device_id':self.device,
-            'supports_ack':True, 'shell_version':'0.4.0', 'display_mode':'virtual_display'}))
+            'supports_ack':True, 'supports_snapshot_ref':True, 'shell_version':'0.5.0', 'display_mode':'virtual_display'}))
         welcome = json.loads(await self.ws.recv())
         assert welcome['type'] == 'welcome', welcome
         self.task = asyncio.create_task(self.run())
@@ -81,7 +81,8 @@ class Peer:
                     if self.hold_action:
                         self.action_received.set()
                         await self.action_release.wait()
-                    await self.reply(req, {'message':'fixture action received'})
+                    await self.reply(req, {'message':'fixture action received', 'screen':{
+                        'snapshot_ref':req['request_id'], 'display_id':2, 'nodes':[]}})
         except ConnectionClosed:
             pass
     async def close(self):

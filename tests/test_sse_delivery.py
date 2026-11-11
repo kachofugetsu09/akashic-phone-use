@@ -12,6 +12,7 @@ import sys
 import httpx
 import pytest
 import uvicorn
+from websockets.asyncio.client import connect
 
 _root = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
@@ -173,6 +174,7 @@ async def test_sse_reconnect_rejects_old_replies_and_ignores_duplicate_response(
                 try:
                     request = await new.request()
                     await new.ack(request)
+                    assert (await old.reply({"type": "ack", "request_id": old_request["request_id"]})).status_code == 409
                     late = {"type": "response", "request_id": old_request["request_id"],
                             "ok": True, "result": {"value": "old"},
                             "state": {"takeover_reason": "stale"}}
@@ -282,3 +284,185 @@ async def test_sse_disconnect_before_headers_does_not_leak_registered_session() 
         finally:
             connecting.cancel()
             await asyncio.gather(connecting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_websocket_write_backpressure_respects_rpc_deadline() -> None:
+    """实际 ASGI 写入受阻时，总期限不能只约束写入后的 ACK 等待。"""
+    write_started = asyncio.Event()
+    release_write = asyncio.Event()
+    expired_before_release = []
+    received = []
+
+    def delay_request_write(app):
+        async def wrapped(scope, receive, send):
+            async def send_frame(message):
+                if message["type"] == "websocket.send" and json.loads(message["text"]).get("type") == "request":
+                    write_started.set()
+                    await release_write.wait()
+                await send(message)
+            await app(scope, receive, send_frame)
+        return wrapped
+
+    async with phone_server(delay_request_write) as (bridge, client):
+        url = str(client.base_url).replace("http://", "ws://").rstrip("/") + "/api/phone/ws"
+        async with connect(url) as ws:
+            await ws.send(json.dumps({"type": "hello", "device_id": "ws-peer", "supports_ack": True}))
+            assert json.loads(await ws.recv())["type"] == "welcome"
+
+            async def reply():
+                frame = json.loads(await ws.recv())
+                received.append(frame["request_id"])
+                await ws.send(json.dumps({"type": "ack", "request_id": frame["request_id"]}))
+                await ws.send(json.dumps({"type": "response", "request_id": frame["request_id"],
+                                          "ok": True, "result": {"received": True}}))
+
+            peer = asyncio.create_task(reply())
+            pending = asyncio.create_task(bridge.rpc(None, "action", {
+                "action": "type_text", "text": "x" * 16384
+            }, timeout_ms=100))
+            await asyncio.wait_for(write_started.wait(), 2)
+
+            def release():
+                expired_before_release.append(pending.done())
+                release_write.set()
+
+            timer = asyncio.get_running_loop().call_later(0.3, release)
+            try:
+                result = (await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 2))[0]
+                await asyncio.wait_for(release_write.wait(), 2)
+                assert expired_before_release == [True], {"received": len(received), "result": result}
+                assert isinstance(result, PhoneNodeError) and "结果不确定" in str(result)
+                assert "发送请求超时" in str(result)
+                assert not received
+            finally:
+                timer.cancel()
+                peer.cancel()
+                pending.cancel()
+                await asyncio.gather(peer, pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_ack_wait_does_not_grant_result_a_new_timeout_budget() -> None:
+    """ACK 消耗原有预算，结果不能借最小等待窗口延长整个请求期限。"""
+    async with phone_server() as (bridge, client):
+        async with sse_peer(client) as peer:
+            ack_ready = asyncio.Event()
+            response_ready = asyncio.Event()
+            pending = asyncio.create_task(bridge.rpc(None, "action", {"action": "tap"}, timeout_ms=100))
+            request = await peer.request()
+            loop = asyncio.get_running_loop()
+            timers = (loop.call_later(0.05, ack_ready.set), loop.call_later(0.12, response_ready.set))
+            try:
+                await ack_ready.wait()
+                await peer.ack(request)
+                await response_ready.wait()
+                assert (await peer.reply({"type": "response", "request_id": request["request_id"],
+                                          "ok": True, "result": {"late": True}})).status_code == 200
+                with pytest.raises(PhoneNodeError, match="结果不确定.*超时"):
+                    await pending
+                assert not bridge._sessions["sse-peer"].pending
+                assert not bridge._sessions["sse-peer"].acks
+            finally:
+                for timer in timers:
+                    timer.cancel()
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["headers", "body"])
+async def test_sse_transport_timeout_never_claims_definitely_unsent(stage) -> None:
+    """进入传输后缺少送达证据，头/正文阻塞也只能报告结果未知。"""
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    def delay_stream(app):
+        async def wrapped(scope, receive, send):
+            async def send_frame(message):
+                should_block = (
+                    stage == "headers" and message["type"] == "http.response.start"
+                    or stage == "body" and message["type"] == "http.response.body"
+                    and b"event: request" in message.get("body", b"")
+                )
+                if should_block:
+                    blocked.set()
+                    await release.wait()
+                await send(message)
+            await app(scope, receive, send_frame)
+        return wrapped
+
+    async with phone_server(delay_stream) as (bridge, client):
+        request = client.build_request("POST", "/api/phone/stream", json={
+            "type": "hello", "device_id": "sse-peer", "supports_ack": True,
+            "supports_connection_id": True,
+        })
+        connecting = asyncio.create_task(client.send(request, stream=True))
+        response = None
+        try:
+            if stage == "headers":
+                await asyncio.wait_for(blocked.wait(), 2)
+            else:
+                response = await connecting
+                peer = SsePeer(client, response, "sse-peer", None, response.aiter_lines())
+                assert (await peer.next_event())[0] == "welcome"
+            pending = asyncio.create_task(bridge.rpc(None, "action", {"action": "tap"}, timeout_ms=100))
+            try:
+                await asyncio.wait_for(blocked.wait(), 2)
+                with pytest.raises(PhoneNodeError, match="结果不确定，可能已执行") as error:
+                    await pending
+                assert "未发送" not in str(error.value)
+                assert "未自动重试" in str(error.value)
+                assert not bridge.list_devices()
+            finally:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+        finally:
+            connecting.cancel()
+            await asyncio.gather(connecting, return_exceptions=True)
+            if response is not None:
+                await response.aclose()
+            release.set()
+
+
+@pytest.mark.asyncio
+async def test_unacked_websocket_close_backpressure_does_not_hold_rpc_or_shutdown(monkeypatch, caplog) -> None:
+    """逻辑下线与物理 close 分开；背压不能阻塞 RPC 或插件关闭。"""
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    def block_close(app):
+        async def wrapped(scope, receive, send):
+            async def send_frame(message):
+                if message["type"] == "websocket.close":
+                    close_started.set()
+                    await release_close.wait()
+                await send(message)
+            await app(scope, receive, send_frame)
+        return wrapped
+
+    monkeypatch.setattr(bridge_module, "CLOSE_TIMEOUT_S", 0.1, raising=False)
+    async with phone_server(block_close) as (bridge, client):
+        url = str(client.base_url).replace("http://", "ws://").rstrip("/") + "/api/phone/ws"
+        async with connect(url) as ws:
+            await ws.send(json.dumps({"type": "hello", "device_id": "sse-peer", "supports_ack": True}))
+            await ws.recv()
+            pending = asyncio.create_task(bridge.rpc(None, "action", {"action": "tap"}, timeout_ms=100))
+            await ws.recv()  # 请求到达，但端侧不回 ACK。
+            await asyncio.wait_for(close_started.wait(), 2)
+            try:
+                # close 仍受阻时，RPC 必须已按原期限报告未知效果。
+                with pytest.raises(PhoneNodeError, match="结果不确定"):
+                    await asyncio.wait_for(asyncio.shield(pending), 0.2)
+                async with sse_peer(client) as replacement:
+                    assert replacement.connection_id
+                    assert len(bridge.list_devices()) == 1
+                    await asyncio.wait_for(bridge.close_all(), 1)
+                    assert not release_close.is_set()
+                    assert not bridge.list_devices()
+                    assert not bridge._closing_transports
+                    assert "phone.transport.close_unconfirmed" in caplog.text
+            finally:
+                release_close.set()
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)

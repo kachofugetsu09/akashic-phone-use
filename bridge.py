@@ -5,7 +5,6 @@ import asyncio
 import base64
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import cast
 from uuid import uuid4
@@ -21,6 +20,8 @@ from .safety import parse_ui_nodes
 logger = logging.getLogger(__name__)
 # 端侧收到请求后立即回 ack；超过这个时间没有 ack 视为下行长连接已失效。
 ACK_TIMEOUT_S = 6.0
+# 插件关闭时只在此宽限内等待已下线连接；取消不等于物理关闭已确认。
+CLOSE_TIMEOUT_S = 5.0
 
 
 class PhoneNodeError(RuntimeError):
@@ -85,6 +86,7 @@ class PhoneBridge:
     def __init__(self) -> None:
         self._sessions: dict[str, _NodeSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._closing_transports: set[asyncio.Task[None]] = set()
 
     def list_devices(self) -> tuple[PhoneDeviceDescriptor, ...]:
         return tuple(
@@ -226,9 +228,11 @@ class PhoneBridge:
     async def unregister_node(self, session: _NodeSession, reason: str = "端侧连接已断开") -> None:
         await self._evict_session(session, reason)
 
-    async def _evict_session(self, session: _NodeSession, reason: str) -> None:
+    async def _evict_session(self, session: _NodeSession, reason: str, *, deadline: float | None = None) -> None:
+        """先逻辑下线，再跟踪传输关闭；不以网络背压延长调用期限。"""
         if session.closed:
             return
+        # 1. 立即撤销路由并结算在途请求，不等待物理关闭。
         session.closed = True
         if self._sessions.get(session.device_id) is session:
             del self._sessions[session.device_id]
@@ -238,12 +242,31 @@ class PhoneBridge:
             if not fut.done():
                 fut.set_exception(PhoneNodeError(f"设备 {session.device_id} 连接中断: {reason}"))
         session.pending.clear()
-        with suppress(Exception):
-            await session.close_transport()
+        # 2. 关闭任务由桥接持有，即使原 RPC 已超时也不丢失 owner。
+        closing = asyncio.create_task(session.close_transport(), name=f"phone-close:{session.device_id}")
+        self._closing_transports.add(closing)
+        closing.add_done_callback(self._transport_closed)
+        if deadline is None:
+            await asyncio.shield(closing)
+        elif (remaining := deadline - asyncio.get_running_loop().time()) > 0:
+            await asyncio.wait((closing,), timeout=remaining)
+
+    def _transport_closed(self, task: asyncio.Task[None]) -> None:
+        self._closing_transports.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("phone.transport.close_failed task=%s", task.get_name(),
+                         exc_info=(type(error), error, error.__traceback__))
 
     async def close_all(self) -> None:
+        """下线所有节点，有界等待关闭；未确认关闭必须保留日志。"""
         for session in tuple(self._sessions.values()):
-            await self._evict_session(session, "Phone 插件正在关闭")
+            await self._evict_session(session, "Phone 插件正在关闭", deadline=asyncio.get_running_loop().time())
+        if self._closing_transports:
+            _, pending = await asyncio.wait(tuple(self._closing_transports), timeout=CLOSE_TIMEOUT_S)
+            for task in pending:
+                logger.warning("phone.transport.close_unconfirmed task=%s grace_s=%.1f", task.get_name(), CLOSE_TIMEOUT_S)
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def rpc(
         self,
@@ -305,18 +328,23 @@ class PhoneBridge:
         started = loop.time()
         tag = f"device={session.device_id} op={op} request={request_id}"
         try:
-            await session.send_json({"type": "request", "request_id": request_id, "op": op, "payload": dict(payload)})
-            # 1. 等端侧确认收到；回包先到也算确认
+            # 1. 传输写入也消耗原有期限；取消写入不能证明端侧没有收到。
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await session.send_json({"type": "request", "request_id": request_id, "op": op, "payload": dict(payload)})
+            except TimeoutError as exc:
+                raise PhoneNodeError(f"发送请求超时 ({timeout_ms}ms)") from exc
+            # 2. 等端侧确认收到；回包先到也算确认
             if session.supports_ack and not await _wait_ack(ack, fut, min(ACK_TIMEOUT_S, deadline - loop.time())):
                 logger.warning("phone.rpc.unacked %s waited_ms=%d", tag, (loop.time() - started) * 1000)
                 _ = session.pending.pop(request_id, None)
                 fut.cancel()
-                await self._evict_session(session, "请求未被端侧确认，下行连接疑似已失效")
+                await self._evict_session(session, "请求未被端侧确认，下行连接疑似已失效", deadline=deadline)
                 raise PhoneNodeError("未收到端侧确认，下行连接疑似失效")
             acked_ms = (loop.time() - started) * 1000
-            # 2. 等回包
+            # 3. 等回包，不给后续阶段追加最小等待窗口。
             try:
-                response = await asyncio.wait_for(fut, timeout=max(0.1, deadline - loop.time()))
+                response = await asyncio.wait_for(fut, timeout=max(0.0, deadline - loop.time()))
             except TimeoutError as exc:
                 logger.warning("phone.rpc.timeout %s acked=%s ack_ms=%d", tag, ack.is_set(), acked_ms)
                 stage = "已收到请求但未在时限内回传结果" if ack.is_set() else "无响应"
@@ -453,7 +481,7 @@ async def _wait_ack(ack: asyncio.Event, fut: asyncio.Future[dict[str, object]], 
         return True
     waiter = asyncio.ensure_future(ack.wait())
     try:
-        done, _ = await asyncio.wait((waiter, fut), timeout=max(0.1, timeout_s), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait((waiter, fut), timeout=max(0.0, timeout_s), return_when=asyncio.FIRST_COMPLETED)
     finally:
         if not waiter.done():
             _ = waiter.cancel()

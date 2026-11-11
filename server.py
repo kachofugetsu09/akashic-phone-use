@@ -216,7 +216,7 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
 
         async def close_transport() -> None:
             if websocket.client_state is WebSocketState.CONNECTED:
-                with suppress(RuntimeError, OSError):
+                with suppress(RuntimeError, OSError, WebSocketDisconnect):
                     await websocket.close(code=1000)
 
         try:

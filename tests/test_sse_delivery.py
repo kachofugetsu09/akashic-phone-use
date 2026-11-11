@@ -147,11 +147,9 @@ async def test_legacy_client_and_missing_identity_fail_without_replacing_session
 
 @pytest.mark.asyncio
 async def test_apk_download_does_not_fall_back_to_incompatible_binary(tmp_path, monkeypatch) -> None:
-    """仅存在旧版真实制品时，下载入口必须明确失败，不能把它当兼容版本。"""
+    """仅存在旧版命名文件时，下载入口必须失败，不能静默回退。"""
     from phone_sse_pkg import server as server_module
-    (tmp_path / "akashic-shell-v0.3.4.apk").write_bytes(
-        (_root / "akashic-shell-v0.3.4.apk").read_bytes()
-    )
+    (tmp_path / "akashic-shell-v0.3.4.apk").write_bytes(b"incompatible artifact; never serve")
     monkeypatch.setattr(server_module, "__file__", str(tmp_path / "server.py"))
     async with phone_server() as (_, client):
         response = await client.get("/api/phone/apk")

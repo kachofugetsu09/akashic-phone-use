@@ -34,6 +34,15 @@
 - WebSocket 帧继续由所属 session 绑定；其 welcome 也提供 `connection_id`，用于可选的 HTTP 回传。
 - `/api/phone/apk` 只提供 `akashic-shell-v0.4.0.apk`。兼容的 release 制品缺席时明确返回 HTTP 404，不回退到仓库中的旧版 APK；debug 构建不等同已发布 release。
 
+### 随附 Shell 0.4.0 制品
+
+- 来源：[`akashic-android-shell` PR #9](https://github.com/kachofugetsu09/akashic-android-shell/pull/9)，源码 `0ca40af54ecf2214def92e041a6ee0abbb25c92a`。
+- 实际变体：`assembleRelease`，R8 与资源裁切启用；包名 `com.akashic.shell`，versionName `0.4.0`、versionCode `12`。
+- APK SHA-256：`86683f2ddae7533eafee325eb0e213951e005c20c433112596c46746e3ee52e0`。
+- 遵循源码中的演示签名配置，使用 Android Debug 证书（SHA-256 `c3dfa0211bb6569291eb214046f65c2e5b8e3a226c1dca6da17c39091ef01f58`）。这是 release 变体，不代表已发布 GitHub release 或完成生产部署。
+
+旧随附 APK 的证书 SHA-256 为 `376ea17860ec9b603006f0077035d533b901a36ea13982cb5311d79121b8b8f9`，与本制品不同，Android 会拒绝同包名的直接覆盖升级。下载入口不执行卸载或清除数据；正式替换前需核对实际已安装证书，并单独安排签名兼容或数据保留方案。源码回退不能撤销手机安装效果。
+
 ## 验证命令
 
 ```sh

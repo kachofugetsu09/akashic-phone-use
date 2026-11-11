@@ -18,8 +18,8 @@
 ## 验证命令
 
 ```sh
-# 1. 200 seeds 确定性 Monkey 测试（覆盖多设备路由、并发断连、收银台接管护栏、主屏冲突）
-PYTHONPATH=/home/huashen/coding/akashic-agent pytest -q tests/test_phone_monkey.py
+# 1. 200 seeds Monkey 与真实本地 WebSocket 故障注入（不代表 Android 真机验收）
+PYTHONPATH=/home/huashen/coding/akashic-agent pytest -q tests/test_phone_monkey.py tests/test_rpc_delivery.py
 
 # 2. 真实 Agent 全链路 E2E 验收（验证 Prompt Cache 哈希不变 + 完整 7 步工具调用 + Turn 自动收尾）
 PYTHONPATH=/home/huashen/coding/akashic-agent python3 e2e_scenario.py

@@ -36,6 +36,11 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
   - 点击已知控件优先传 `node_id`：`phone_action(description="点击搜索按钮", action="tap", node_id=3)`；
   - 只有在自定义绘制界面（游戏、Canvas、无标签图标）导致节点树缺失时，才将 `include_screenshot=true` 传给 `phone_observe` 或 `phone_action`，结合视觉截图用 `x, y` 坐标点击。
 
+### 断连与结果丢失
+- 每次请求只发送一次。未收到确认、连接中断或等待结果超时都可能发生在端侧已经执行之后；工具会报告“结果不确定，可能已执行”，不会自动重发。
+- 遇到结果不确定时，先用 `phone_devices` 确认设备重连，再显式调用 `phone_observe` 核实状态；无法确认的动作应如实说明，不把超时当作未执行，也不要直接重复点击、输入或收尾。
+- `phone_observe` 也可能初始化、唤醒或重建虚拟屏，因此同样不自动重试。端侧明确返回拒绝原因时，按该原因恢复。
+
 ### 敏感动作护栏与主屏接管（Ask / Takeover）
 - **绝不代点支付与密码**：当后台虚拟屏进入收银台、支付密码、转账确认、生物识别、`FLAG_SECURE` 安全窗口或短信/滑块验证页面时，端侧会自动把悬浮小窗切换为**橙色呼吸光晕（`pip_state="needs_you"`）**并在快照顶部标注 `TAKEOVER REQUIRED`。
 - **主动移交主屏（`hand_to_user`）**：遇到需要用户本人输入密码、确认付款或扫码时，调用：

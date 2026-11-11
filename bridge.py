@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import cast
+from uuid import uuid4
 
 from .contract import (
     PhoneDeviceDescriptor,
@@ -20,8 +21,6 @@ from .safety import detect_takeover_reason, parse_ui_nodes
 logger = logging.getLogger(__name__)
 # 端侧收到请求后立即回 ack；超过这个时间没有 ack 视为下行长连接已失效。
 ACK_TIMEOUT_S = 6.0
-# 判定长连接失效后，等待端侧重连的最长时间。
-RECONNECT_WAIT_S = 15.0
 
 
 class PhoneNodeError(RuntimeError):
@@ -85,7 +84,6 @@ class PhoneBridge:
     def __init__(self) -> None:
         self._sessions: dict[str, _NodeSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        self._seq = 0
 
     def list_devices(self) -> tuple[PhoneDeviceDescriptor, ...]:
         return tuple(
@@ -175,8 +173,9 @@ class PhoneBridge:
                 fut = session.pending.pop(request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(dict(frame))
-            if isinstance(frame.get("state"), Mapping):
-                self._apply_state_update(session, cast(Mapping[str, object], frame["state"]))
+                    # 旧请求的迟到回包不能覆盖重连后或后续请求的设备状态。
+                    if isinstance(frame.get("state"), Mapping):
+                        self._apply_state_update(session, cast(Mapping[str, object], frame["state"]))
 
     # 端侧确认收到请求；顺带上报上次回传失败等端侧诊断。
     def _handle_ack(self, session: _NodeSession, frame: Mapping[str, object]) -> None:
@@ -255,12 +254,8 @@ class PhoneBridge:
         deadline = loop.time() + max(0.1, timeout_ms / 1000.0)
         lock = self._locks.setdefault(target_id, asyncio.Lock())
         async with lock:
-            # 1. 首发；端侧未确认说明下行长连接已失效，等它重连后在新连接上重发一次
-            response = await self._send_request(self._live_session(target_id), op, payload, deadline, timeout_ms, may_retry=True)
-            if response is None:
-                session = await self._wait_reconnect(target_id, deadline)
-                response = await self._send_request(session, op, payload, deadline, timeout_ms, may_retry=False)
-        assert response is not None
+            # ACK 或结果丢失不能证明端侧未执行；每次调用只发送一次。
+            response = await self._send_request(self._live_session(target_id), op, payload, deadline, timeout_ms)
         if not response.get("ok", False):
             error_msg = str(response.get("error") or f"设备 {target_id} 拒绝执行 {op}")
             raise PhoneNodeError(error_msg)
@@ -273,18 +268,6 @@ class PhoneBridge:
             raise PhoneNodeError(f"设备 {device_id!r} 不在线")
         return session
 
-    # 等端侧在新长连接上重新注册；超过截止时间或重连等待上限则报错。
-    async def _wait_reconnect(self, device_id: str, deadline: float) -> _NodeSession:
-        loop = asyncio.get_running_loop()
-        limit = min(deadline, loop.time() + RECONNECT_WAIT_S)
-        while loop.time() < limit:
-            session = self._sessions.get(device_id)
-            if session is not None and not session.closed:
-                return session
-            await asyncio.sleep(0.2)
-        raise PhoneNodeError(f"设备 {device_id} 下行连接失效，且未在 {RECONNECT_WAIT_S:.0f}s 内重连")
-
-    # 发出一次请求并等待回包；端侧支持 ack 却没确认时，可重试则返回 None。
     async def _send_request(
         self,
         session: _NodeSession,
@@ -292,12 +275,11 @@ class PhoneBridge:
         payload: Mapping[str, object],
         deadline: float,
         timeout_ms: int,
-        *,
-        may_retry: bool,
-    ) -> dict[str, object] | None:
+    ) -> dict[str, object]:
+        """发送一次请求；无法取得结果时保留端侧可能已经执行的事实。"""
         loop = asyncio.get_running_loop()
-        self._seq += 1
-        request_id = f"req-{self._seq}"
+        # 端侧去重表可跨连接保留，不能因服务端重启复用 req-1 等 ID。
+        request_id = f"req-{uuid4().hex}"
         fut: asyncio.Future[dict[str, object]] = loop.create_future()
         ack = asyncio.Event()
         session.pending[request_id] = fut
@@ -310,10 +292,9 @@ class PhoneBridge:
             if session.supports_ack and not await _wait_ack(ack, fut, min(ACK_TIMEOUT_S, deadline - loop.time())):
                 logger.warning("phone.rpc.unacked %s waited_ms=%d", tag, (loop.time() - started) * 1000)
                 _ = session.pending.pop(request_id, None)
+                fut.cancel()
                 await self._evict_session(session, "请求未被端侧确认，下行连接疑似已失效")
-                if may_retry and deadline - loop.time() > 1.0:
-                    return None
-                raise PhoneNodeError(f"设备 {session.device_id} 没有收到 {op} 请求（下行连接失效）")
+                raise PhoneNodeError("未收到端侧确认，下行连接疑似失效")
             acked_ms = (loop.time() - started) * 1000
             # 2. 等回包
             try:
@@ -322,10 +303,11 @@ class PhoneBridge:
                 logger.warning("phone.rpc.timeout %s acked=%s ack_ms=%d", tag, ack.is_set(), acked_ms)
                 stage = "已收到请求但未在时限内回传结果" if ack.is_set() else "无响应"
                 raise PhoneNodeError(f"设备 {session.device_id} 执行 {op} 超时 ({timeout_ms}ms)：{stage}") from exc
-            except PhoneNodeError:
-                raise
-            except Exception as exc:
-                raise PhoneNodeError(f"设备 {session.device_id} 通信失败: {exc}") from exc
+        except (PhoneNodeError, OSError) as exc:
+            raise PhoneNodeError(
+                f"设备 {session.device_id} 执行 {op} 的结果不确定，可能已执行；"
+                f"未自动重试。请在设备在线后先调用 phone_observe 核实，再决定是否继续。原因：{exc}"
+            ) from exc
         finally:
             _ = session.pending.pop(request_id, None)
             _ = session.acks.pop(request_id, None)

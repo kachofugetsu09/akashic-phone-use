@@ -249,13 +249,27 @@ class PhoneBridge:
         *,
         timeout_ms: int = 30_000,
     ) -> dict[str, object]:
+        """排队与执行共享截止时间，过期请求不再发往端侧。"""
         target_id = self.resolve_device_id(device_id)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.1, timeout_ms / 1000.0)
         lock = self._locks.setdefault(target_id, asyncio.Lock())
-        async with lock:
+        not_sent = f"设备 {target_id} 的 {op} 请求排队超时 ({timeout_ms}ms)，未发送到端侧。"
+        # 1. 排队也消耗调用期限，超时不意味着端侧出现未知效果。
+        try:
+            async with asyncio.timeout_at(deadline):
+                await lock.acquire()
+        except TimeoutError as exc:
+            raise PhoneNodeError(not_sent) from exc
+        try:
+            # 锁可立即取得时未必让出事件循环，仍须拒绝已经过期的请求。
+            if loop.time() >= deadline:
+                raise PhoneNodeError(not_sent)
+            # 2. 发送后的断连或超时由 _send_request 报告结果不确定。
             # ACK 或结果丢失不能证明端侧未执行；每次调用只发送一次。
             response = await self._send_request(self._live_session(target_id), op, payload, deadline, timeout_ms)
+        finally:
+            lock.release()
         if not response.get("ok", False):
             error_msg = str(response.get("error") or f"设备 {target_id} 拒绝执行 {op}")
             raise PhoneNodeError(error_msg)

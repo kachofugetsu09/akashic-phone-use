@@ -38,6 +38,7 @@ class ProtocolPeer:
         self.old_id: str | None = None
         self.stale_sent = asyncio.Event()
         self.release_response = asyncio.Event()
+        self.first_received = asyncio.Event()
 
     async def accept(self, ws) -> None:
         """将真实 WebSocket 连接接到被测桥接的会话边界。"""
@@ -70,6 +71,7 @@ class ProtocolPeer:
                     self.requests.append(frame)
                     request_id = frame["request_id"]
                     if len(self.requests) == 1:
+                        self.first_received.set()
                         self.old_id = request_id
                         if self.fault == "unacked":
                             continue
@@ -80,6 +82,8 @@ class ProtocolPeer:
                         await ws.send(json.dumps({"type": "ack", "request_id": request_id}))
                     if self.fault == "timeout":
                         continue
+                    if self.fault == "block_first" and len(self.requests) == 1:
+                        await self.release_response.wait()
                     if self.fault == "stale" and len(self.requests) == 2:
                         await ws.send(json.dumps({
                             "type": "response", "request_id": self.old_id,
@@ -183,3 +187,40 @@ async def test_request_ids_survive_bridge_restart_without_reuse() -> None:
             await bridge.rpc(None, "observe", {})
             ids.append(peer.requests[0]["request_id"])
     assert ids[0] != ids[1]
+
+
+@pytest.mark.asyncio
+async def test_expired_queued_action_never_reaches_peer() -> None:
+    """第一条动作阻塞到第二条截止时间之后，第二条必须在队列中失败。"""
+    async with peer_connection("block_first") as (bridge, peer):
+        first = asyncio.create_task(bridge.rpc(None, "action", {"action": "tap"}))
+        await asyncio.wait_for(peer.first_received.wait(), 2)
+        second = asyncio.create_task(bridge.rpc(
+            None, "action", {"action": "type_text", "text": "must-not-send"}, timeout_ms=100
+        ))
+        # 真实时限到期后才释放第一条响应，直接检查 peer 收到的请求。
+        expired_before_release = []
+
+        def release_first():
+            expired_before_release.append(second.done())
+            peer.release_response.set()
+
+        release = asyncio.get_running_loop().call_later(0.3, release_first)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.gather(first, second, return_exceptions=True), 2
+            )
+            assert result[0] == {"source": "current"}
+            assert len(peer.requests) == 1, peer.requests
+            assert isinstance(result[1], PhoneNodeError)
+            assert "未发送" in str(result[1])
+            assert "结果不确定" not in str(result[1])
+            assert expired_before_release == [True]
+            # 排队超时不应锁死设备或淘汰仍在工作的连接。
+            assert await bridge.rpc(None, "observe", {}) == {"source": "current"}
+            assert [frame["op"] for frame in peer.requests] == ["action", "observe"]
+        finally:
+            release.cancel()
+            first.cancel()
+            second.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)

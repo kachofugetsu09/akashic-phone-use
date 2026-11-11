@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import importlib.util
 import json
 from pathlib import Path
+import socket
 import sys
 
 import pytest
@@ -41,6 +42,7 @@ class ProtocolPeer:
         self.release_response = asyncio.Event()
         self.first_received = asyncio.Event()
         self.screen = screen
+        self.held_ack = None
 
     async def accept(self, ws) -> None:
         """将真实 WebSocket 连接接到被测桥接的会话边界。"""
@@ -55,7 +57,11 @@ class ProtocolPeer:
         await ws.send(json.dumps({"type": "welcome"}))
         try:
             async for raw in ws:
-                self.bridge.handle_incoming(session, json.loads(raw))
+                frame = json.loads(raw)
+                if self.fault == "late_ack" and frame.get("type") == "ack":
+                    self.held_ack = (session, frame)
+                else:
+                    self.bridge.handle_incoming(session, frame)
         finally:
             await self.bridge.unregister_node(session)
 
@@ -84,6 +90,8 @@ class ProtocolPeer:
                         await ws.send(json.dumps({"type": "ack", "request_id": request_id}))
                     if self.fault == "timeout":
                         continue
+                    if self.fault == "late_ack":
+                        await self.release_response.wait()
                     if self.fault == "block_first" and len(self.requests) == 1:
                         await self.release_response.wait()
                     if self.screen is not None:
@@ -300,3 +308,81 @@ async def test_explicit_takeover_survives_omitted_field_until_resume() -> None:
         assert resumed is not None and resumed.takeover_reason is None
         await bridge.perform_action(None, {"action": "tap", "x": 20, "y": 20})
         assert len(peer.requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_ack_at_timeout_boundary_keeps_live_connection(monkeypatch) -> None:
+    """真实 ACK 在 wait 超时返回后投递，事件为真时不能误判为未确认。"""
+    monkeypatch.setattr(bridge_module, "ACK_TIMEOUT_S", 0.1)
+    async with peer_connection("late_ack") as (bridge, peer):
+        original_wait = asyncio.wait
+        delivered = []
+        node_session = bridge._sessions["fault-peer"]
+
+        async def wait_then_deliver_ack(futures, **kwargs):
+            # 只控制桥接等待的调度，不替换 asyncio.wait 的真实超时结果。
+            pending = node_session.pending.values()
+            is_rpc_wait = any(future in pending for future in futures)
+            result = await original_wait(futures, **kwargs)
+            if is_rpc_wait and not result[0]:
+                assert peer.held_ack is not None
+                session, frame = peer.held_ack
+                bridge.handle_incoming(session, frame)
+                assert session.acks[frame["request_id"]].is_set()
+                delivered.append(frame["request_id"])
+                peer.release_response.set()
+            return result
+
+        monkeypatch.setattr(asyncio, "wait", wait_then_deliver_ack)
+        assert await bridge.rpc(None, "action", {"action": "tap"}) == {"source": "current"}
+        assert len(delivered) == 1
+        assert len(peer.requests) == 1
+        assert len(bridge.list_devices()) == 1
+
+
+@pytest.mark.asyncio
+async def test_starlette_send_disconnect_becomes_phone_error() -> None:
+    """真实监听器经过 Starlette 将 ASGI 写入错误转换成明确的 RPC 错误。"""
+    import uvicorn
+    from phone_rpc_pkg.server import PhoneListenerServer, create_phone_app
+
+    bridge = PhoneBridge()
+    app = create_phone_app(bridge)
+    failed_requests = []
+
+    async def fail_request_send(scope, receive, send):
+        async def send_frame(message):
+            if message["type"] == "websocket.send":
+                frame = json.loads(message["text"])
+                if frame.get("type") == "request":
+                    failed_requests.append(frame)
+                    raise OSError("injected ASGI write failure")
+            await send(message)
+
+        await app(scope, receive, send_frame)
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.setblocking(False)
+    server = PhoneListenerServer(uvicorn.Config(
+        fail_request_send, log_level="error", lifespan="off", ws="websockets-sansio"
+    ))
+    running = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        await asyncio.wait_for(server.ready.wait(), 2)
+        port = listener.getsockname()[1]
+        async with connect(f"ws://127.0.0.1:{port}/api/phone/ws") as ws:
+            await ws.send(json.dumps({"type": "hello", "device_id": "asgi-peer", "supports_ack": True}))
+            assert json.loads(await ws.recv())["type"] == "welcome"
+            with pytest.raises(PhoneNodeError, match="结果不确定，可能已执行"):
+                await bridge.rpc(None, "action", {"action": "tap"})
+            # Starlette 已将 application_state 标为断开，下一次调用也应是可识别错误。
+            with pytest.raises(PhoneNodeError, match="结果不确定，可能已执行"):
+                await bridge.rpc(None, "observe", {})
+            assert len(failed_requests) == 1
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(running, 3)
+        listener.close()
+        await bridge.close_all()

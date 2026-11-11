@@ -453,4 +453,5 @@ async def _wait_ack(ack: asyncio.Event, fut: asyncio.Future[dict[str, object]], 
     finally:
         if not waiter.done():
             _ = waiter.cancel()
-    return bool(done)
+    # 超时回调和接收回调可能同轮运行，wait 的 done 集合不一定反映最新状态。
+    return bool(done) or ack.is_set() or fut.done()

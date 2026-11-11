@@ -18,7 +18,7 @@ import uvicorn
 from agent.plugin_composition import Context
 from core.common.unix_socket import prepare_unix_socket, socket_alias_path
 
-from .bridge import PhoneBridge
+from .bridge import PhoneBridge, PhoneNodeError
 
 logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = 10.0
@@ -183,8 +183,16 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
         session = None
 
         async def send_json(payload: dict[str, object]) -> None:
-            if websocket.client_state is WebSocketState.CONNECTED:
+            """发送帧，并在传输边界将断连转换成桥接错误。"""
+            if (
+                websocket.client_state is not WebSocketState.CONNECTED
+                or websocket.application_state is not WebSocketState.CONNECTED
+            ):
+                raise PhoneNodeError("WebSocket 连接已断开")
+            try:
                 await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+            except WebSocketDisconnect as exc:
+                raise PhoneNodeError(f"WebSocket 发送失败（断连码 {exc.code}）") from exc
 
         async def close_transport() -> None:
             if websocket.client_state is WebSocketState.CONNECTED:
@@ -211,7 +219,7 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
                         await send_json({"type": "pong", "ts": frame.get("ts")})
                     else:
                         bridge.handle_incoming(session, cast(dict[str, object], frame))
-        except (WebSocketDisconnect, TimeoutError, ValueError, OSError):
+        except (WebSocketDisconnect, PhoneNodeError, TimeoutError, ValueError, OSError):
             pass
         finally:
             if session is not None:

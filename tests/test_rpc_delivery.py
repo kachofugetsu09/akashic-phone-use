@@ -22,6 +22,7 @@ _pkg = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _pkg
 _spec.loader.exec_module(_pkg)
 from phone_rpc_pkg import bridge as bridge_module
+from phone_rpc_pkg.safety import format_screen_snapshot
 
 PhoneBridge = bridge_module.PhoneBridge
 PhoneNodeError = bridge_module.PhoneNodeError
@@ -30,7 +31,7 @@ PhoneNodeError = bridge_module.PhoneNodeError
 class ProtocolPeer:
     """记录实际收到的请求，并按指定故障丢弃确认或结果。"""
 
-    def __init__(self, bridge, fault: str) -> None:
+    def __init__(self, bridge, fault: str, screen: dict | None = None) -> None:
         self.bridge = bridge
         self.fault = fault
         self.requests: list[dict] = []
@@ -39,6 +40,7 @@ class ProtocolPeer:
         self.stale_sent = asyncio.Event()
         self.release_response = asyncio.Event()
         self.first_received = asyncio.Event()
+        self.screen = screen
 
     async def accept(self, ws) -> None:
         """将真实 WebSocket 连接接到被测桥接的会话边界。"""
@@ -84,6 +86,20 @@ class ProtocolPeer:
                         continue
                     if self.fault == "block_first" and len(self.requests) == 1:
                         await self.release_response.wait()
+                    if self.screen is not None:
+                        action = frame.get("payload", {}).get("action")
+                        if action == "hand_to_user":
+                            self.screen["takeover_reason"] = frame["payload"]["reason"]
+                            self.screen["pip_state"] = "needs_you"
+                        elif action == "resume_from_user":
+                            self.screen["takeover_reason"] = None
+                            self.screen["pip_state"] = "running"
+                        result = (
+                            {"message": "peer received action", "screen": dict(self.screen)}
+                            if frame["op"] == "action" else dict(self.screen)
+                        )
+                        await self.reply(ws, request_id, result)
+                        continue
                     if self.fault == "stale" and len(self.requests) == 2:
                         await ws.send(json.dumps({
                             "type": "response", "request_id": self.old_id,
@@ -109,10 +125,10 @@ class ProtocolPeer:
 
 
 @asynccontextmanager
-async def peer_connection(fault: str):
+async def peer_connection(fault: str, screen: dict | None = None):
     """为每个场景使用独立端口和会话，退出时完整关闭。"""
     bridge = PhoneBridge()
-    peer = ProtocolPeer(bridge, fault)
+    peer = ProtocolPeer(bridge, fault, screen)
     async with serve(peer.accept, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         task = asyncio.create_task(peer.run(f"ws://127.0.0.1:{port}"))
@@ -224,3 +240,63 @@ async def test_expired_queued_action_never_reaches_peer() -> None:
             first.cancel()
             second.cancel()
             await asyncio.gather(first, second, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("package,activity,text", [
+    ("com.example.fixture", "VerifyActivity", "短信验证码"),
+    ("com.example.fixture", "MainActivity", "确认支付"),
+    ("com.example.fixture", "PasswordActivity", "输入支付密码"),
+    ("com.example.wallet", "MainActivity", "请输入验证码"),
+])
+async def test_authorized_content_does_not_force_takeover(package, activity, text) -> None:
+    """授权页面的内容不是接管指令；检查普通点击确实到达协议 peer。"""
+    screen = {
+        "package_name": package, "activity_name": activity,
+        "nodes": [{"node_id": 1, "text": text, "bounds": [0, 0, 40, 40], "clickable": True}],
+    }
+    async with peer_connection("screen", screen) as (bridge, peer):
+        observed = await bridge.observe(None)
+        _, after = await bridge.perform_action(None, {"action": "tap", "node_id": 1})
+        assert observed.takeover_reason is None
+        assert observed.nodes[0].text == text
+        assert after is not None and after.takeover_reason is None
+        assert [frame["op"] for frame in peer.requests] == ["observe", "action"]
+
+
+@pytest.mark.asyncio
+async def test_secure_window_reports_capture_limit_without_forcing_takeover() -> None:
+    screen = {"secure_window": True, "nodes": []}
+    async with peer_connection("screen", screen) as (bridge, peer):
+        observed = await bridge.observe(None)
+        await bridge.perform_action(None, {"action": "tap", "x": 20, "y": 20})
+        rendered = format_screen_snapshot(observed)
+        assert observed.secure_window is True
+        assert observed.screenshot_png is None
+        assert "FLAG_SECURE" in rendered and "截图可能受限" in rendered
+        assert "TAKEOVER REQUIRED" not in rendered
+        assert len(peer.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_explicit_takeover_survives_omitted_field_until_resume() -> None:
+    """省略字段不能撤销已确认接管；端侧明确清除后才恢复普通动作。"""
+    screen = {"nodes": []}
+    async with peer_connection("screen", screen) as (bridge, peer):
+        _, held = await bridge.perform_action(None, {
+            "action": "hand_to_user", "reason": "请用户检查当前选项"
+        })
+        assert held is not None and held.takeover_reason == "请用户检查当前选项"
+        with pytest.raises(PhoneNodeError, match="等待用户主屏接管"):
+            await bridge.perform_action(None, {"action": "tap", "x": 20, "y": 20})
+        assert len(peer.requests) == 1
+        screen.pop("takeover_reason")
+        observed = await bridge.observe(None)
+        assert observed.takeover_reason == "请用户检查当前选项"
+        with pytest.raises(PhoneNodeError, match="等待用户主屏接管"):
+            await bridge.perform_action(None, {"action": "tap", "x": 20, "y": 20})
+        assert len(peer.requests) == 2
+        _, resumed = await bridge.perform_action(None, {"action": "resume_from_user"})
+        assert resumed is not None and resumed.takeover_reason is None
+        await bridge.perform_action(None, {"action": "tap", "x": 20, "y": 20})
+        assert len(peer.requests) == 4

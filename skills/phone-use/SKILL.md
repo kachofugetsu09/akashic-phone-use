@@ -5,7 +5,7 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 
 # Phone Use（Android 端侧后台虚拟屏控制）
 
-`phone-use` 插件让 Akashic 在不打断用户手机主屏幕（前台聊天与输入焦点保持不变）的前提下，通过 `akashic-android-shell` 的无线调试常驻助手（UID 2000 `ShellService`）在**后台虚拟屏幕（`VirtualDisplay`）**中启动并操作任意 Android 应用，同时在用户手机右下角提供实时画中画悬浮小窗（`AgentPip`）预览。
+`phone-use` 插件通过 `akashic-android-shell` 的无线调试助手（UID 2000 `ShellService`）在**后台虚拟屏幕（`VirtualDisplay`）**中启动并操作端侧支持的 Android 应用，使用悬浮小窗（`AgentPip`）预览。应用兼容性、权限和焦点隔离依赖设备与 Android 版本，以返回状态和实际观察为准。
 
 为了保护对话的 Prompt Cache（前缀缓存），手机在线状态绝不写进系统提示词或 `channel.origin`，`phone-use` 工具组也**不在常驻工具 schema 中**。
 
@@ -27,7 +27,7 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 ## 2. 核心设计机制与操作准则
 
 ### 后台虚拟屏与主屏隔离
-- **不抢主屏焦点**：虚拟屏带有 `FLAG_TRUSTED | FLAG_OWN_DISPLAY_GROUP | FLAG_ALWAYS_UNLOCKED | FLAG_OWN_FOCUS | FLAG_STEAL_TOP_FOCUS_DISABLED` 以及 `DISPLAY_IME_POLICY_LOCAL`。用户在手机主屏 `Akashic Shell` 里打字聊天时，后台虚拟屏的点击和输入法不会抢走主屏焦点。
+- **焦点隔离**：端侧请求 `FLAG_TRUSTED | FLAG_OWN_DISPLAY_GROUP | FLAG_ALWAYS_UNLOCKED | FLAG_OWN_FOCUS | FLAG_STEAL_TOP_FOCUS_DISABLED` 与 `DISPLAY_IME_POLICY_LOCAL`；这些配置不替代对当前设备焦点行为的验证。
 - **主屏占用避让（`START_IN_USE_ON_MAIN`）**：如果用户此时正在主屏幕前台使用某个 App（非 `Akashic Shell`），端侧拒绝把该 App 强行抽到后台虚拟屏。收到占用提示时，礼貌询问用户或等用户切回聊天界面后再操作。
 - **后台自动静音与静默粘贴**：后台虚拟屏打开音视频应用时自动通过 `appops PLAY_AUDIO ignore` 静音；`type_text` 遇到非标准输入框时通过 `shell` 剪贴板附带 `SUPPRESS_CLIPBOARD_OVERLAY` 与 `EXTRA_IS_SENSITIVE` 粘贴并立即还原用户原剪贴板。
 
@@ -42,18 +42,20 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 - 遇到结果不确定时，先用 `phone_devices` 确认设备重连，再显式调用 `phone_observe` 核实状态；无法确认的动作应如实说明，不把超时当作未执行，也不要直接重复点击、输入或收尾。
 - `phone_observe` 也可能初始化、唤醒或重建虚拟屏，因此同样不自动重试。端侧明确返回拒绝原因时，按该原因恢复。
 
-### 敏感动作护栏与主屏接管（Ask / Takeover）
-- **绝不代点支付与密码**：当后台虚拟屏进入收银台、支付密码、转账确认、生物识别、`FLAG_SECURE` 安全窗口或短信/滑块验证页面时，端侧会自动把悬浮小窗切换为**橙色呼吸光晕（`pip_state="needs_you"`）**并在快照顶部标注 `TAKEOVER REQUIRED`。
-- **主动移交主屏（`hand_to_user`）**：遇到需要用户本人输入密码、确认付款或扫码时，调用：
+### 用户授权与明确接管（Ask / Takeover）
+- **按用户授权操作**：密码、验证码或支付字样本身不触发暂停或强制移交。不要因这些内容自行缩减用户已经明确授予的数据读取与输入权限；工具执行结果仍需观察核实。
+- **如实报告能力限制**：设备报告 `FLAG_SECURE` 时，截图可能受限；Android 的认证、截图与输入权限仍然适用。不要伪造不可读取的内容或把能力受限说成用户已请求接管，也不保证特定应用或金融交易可执行。
+- **明确接管状态**：端侧明确上报 `takeover_reason` 时，普通动作暂停，快照标注 `TAKEOVER REQUIRED`。可以观察状态；观察快照省略该字段不会自动结束接管，恢复需要端侧明确清除状态。
+- **主动移交主屏（`hand_to_user`）**：用户要求移交，或任务确实需要用户手动处理时，调用：
   ```json
   {
-    "description": "移交主屏请用户确认支付",
+    "description": "按用户要求移交主屏检查选项",
     "action": "hand_to_user",
-    "reason": "请确认订单金额并完成支付验证"
+    "reason": "请用户检查当前选项"
   }
   ```
-  然后在对话里告诉用户：“我已经把页面切到手机主屏（或点击右下角橙色呼吸小窗即可打开），请确认完成后告诉我。”并结束当前回合。
-- **收回后台继续（`resume_from_user`）**：当用户回复“好了/付完了”后，调用 `phone_action(description="收回后台虚拟屏继续", action="resume_from_user")` 检查完成状态并收尾。
+  根据端侧返回结果告知用户当前移交状态，请用户完成后回复；不要把请求已发送等同于主屏切换已成功。
+- **收回后台继续（`resume_from_user`）**：用户确认手动处理完成后，调用 `phone_action(description="收回后台虚拟屏继续", action="resume_from_user")`，检查接管状态已解除后继续。
 
 ### Turn 结束自动收尾
 - 当前对话 Turn 闭合（`complete` / `quiet` / `abandoned`）时，`phone-use` 插件的后台 follower 会自动向手机端发送 `finishDisplay`，释放虚拟屏幕、恢复被静音的应用并还原剪贴板；也可以在最后一步 `phone_action` 中通过 `keep_packages` / `close_packages` 指定哪些应用保留在系统最近任务、哪些直接关闭。

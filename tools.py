@@ -58,7 +58,7 @@ class PhoneActionInput(BaseModel):
             "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 node_id 或 x/y 点击）、"
             "type_text（向输入框或聚焦控件输入文本，支持静默剪贴板粘贴并自动还原）、"
             "clear_text、scroll（up/down/left/right）、swipe、press_key、back、"
-            "open_link、share_text、wait、hand_to_user（将应用移交手机主屏幕请用户本人操作支付/验证）、"
+            "open_link、share_text、wait、hand_to_user（按用户要求将应用移交手机主屏幕）、"
             "resume_from_user（用户完成主屏幕操作后收回后台虚拟屏继续）。"
         )
     )
@@ -109,7 +109,7 @@ class PhoneActionInput(BaseModel):
         if act == "share_text" and (not self.package_name or not self.text):
             raise ValueError("share_text 必须同时提供 package_name 与 text")
         if act == "hand_to_user" and not self.reason:
-            raise ValueError("hand_to_user 必须提供 reason 说明需要用户亲自处理的原因")
+            raise ValueError("hand_to_user 必须提供 reason 说明移交原因")
         return self
 
 

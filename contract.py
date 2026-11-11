@@ -62,6 +62,7 @@ class PhoneScreenSnapshot:
     nodes: tuple[PhoneUiNode, ...]
     screenshot_png: bytes | None = None
     takeover_reason: str | None = None
+    secure_window: bool = False
 
 
 @dataclass(frozen=True, slots=True)

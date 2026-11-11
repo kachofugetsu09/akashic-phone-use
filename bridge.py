@@ -16,7 +16,7 @@ from .contract import (
     PhonePipState,
     PhoneScreenSnapshot,
 )
-from .safety import detect_takeover_reason, parse_ui_nodes
+from .safety import parse_ui_nodes
 
 logger = logging.getLogger(__name__)
 # 端侧收到请求后立即回 ack；超过这个时间没有 ack 视为下行长连接已失效。
@@ -359,11 +359,11 @@ class PhoneBridge:
         if session is None or session.closed:
             raise PhoneNodeError(f"设备 {target_id!r} 不在线")
         action = str(payload.get("action") or "")
-        # 若当前设备处于待用户主屏接管状态，除 resume_from_user / hand_to_user 外拒绝盲目继续点击
+        # 只尊重明确的接管状态，不根据页面内容推断用户意图。
         if session.takeover_reason and action not in ("resume_from_user", "hand_to_user"):
             raise PhoneNodeError(
                 f"设备 {target_id} 当前正在等待用户主屏接管 ({session.takeover_reason})；"
-                "请先提示用户在手机上完成操作，再调用 resume_from_user 或 phone_observe。"
+                "可先调用 phone_observe 查看状态；用户完成后调用 resume_from_user。"
             )
         raw = await self.rpc(target_id, "action", payload, timeout_ms=timeout_ms)
         summary = str(raw.get("message") or f"已执行 {action}")
@@ -401,19 +401,12 @@ class PhoneBridge:
         nodes = parse_ui_nodes(raw.get("nodes"))
         package_name = str(raw.get("package_name") or "com.android.shell")
         activity_name = str(raw.get("activity_name") or "MainActivity")
-        explicit_takeover = (
-            str(raw["takeover_reason"])
-            if isinstance(raw.get("takeover_reason"), str) and raw.get("takeover_reason")
-            else None
-        )
+        # 缺少字段不表示用户已结束接管；清除状态必须由端侧明确上报。
+        takeover = session.takeover_reason if session is not None else None
+        if "takeover_reason" in raw:
+            reason = raw["takeover_reason"]
+            takeover = reason if isinstance(reason, str) and reason else None
         secure_window = bool(raw.get("secure_window", False))
-        takeover = detect_takeover_reason(
-            package_name=package_name,
-            activity_name=activity_name,
-            nodes=nodes,
-            explicit_reason=explicit_takeover,
-            secure_window=secure_window,
-        )
         pip_state = _valid_pip_state(raw.get("pip_state", "needs_you" if takeover else "running"))
         if takeover:
             pip_state = "needs_you"
@@ -446,6 +439,7 @@ class PhoneBridge:
             nodes=nodes,
             screenshot_png=png_bytes,
             takeover_reason=takeover,
+            secure_window=secure_window,
         )
 
 

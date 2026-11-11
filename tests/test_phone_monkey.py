@@ -1,4 +1,4 @@
-"""Phone Bridge 状态机、多设备路由、主屏接管护栏与并发断连的确定性 Monkey 测试（200 seeds）。"""
+"""Phone Bridge 状态机、多设备路由、明确接管与并发断连的 Monkey 测试（200 seeds）。"""
 from __future__ import annotations
 
 import asyncio
@@ -35,7 +35,7 @@ def _load_package():
 
 _load_package()
 from phone_use_pkg.bridge import PhoneBridge, PhoneNodeError
-from phone_use_pkg.safety import detect_takeover_reason, format_screen_snapshot, parse_ui_nodes
+from phone_use_pkg.safety import format_screen_snapshot, parse_ui_nodes
 
 _TINY_PNG = base64.b64encode(
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -142,7 +142,7 @@ class _SimulatedAndroidNode:
             if pkg not in self.active_packages:
                 self.active_packages.append(pkg)
         elif action == "hand_to_user":
-            self.takeover_reason = str(payload.get("reason") or "需要用户确认支付")
+            self.takeover_reason = str(payload.get("reason") or "用户请求检查选项")
             self.pip_state = "needs_you"
         elif action == "resume_from_user":
             self.takeover_reason = None
@@ -151,9 +151,6 @@ class _SimulatedAndroidNode:
 
         pkg = self.active_packages[-1] if self.active_packages else "com.tencent.mm"
         act = "com.tencent.mm.plugin.wallet.PayActivity" if self.payment_page else "com.tencent.mm.ui.LauncherUI"
-        if self.payment_page and not self.takeover_reason:
-            self.takeover_reason = f"检测到敏感页面【立即支付】({pkg})，已挂起后台操作并请求主屏接管"
-            self.pip_state = "needs_you"
         nodes = [
             {
                 "node_id": 1,
@@ -237,7 +234,7 @@ async def test_monkey_phone_bridge_invariants(seed: int) -> None:
                 "observe",
                 "launch_app",
                 "tap",
-                "trigger_payment_takeover",
+                "show_authorized_page",
                 "hand_to_user",
                 "resume_from_user",
                 "finish",
@@ -289,23 +286,21 @@ async def test_monkey_phone_bridge_invariants(seed: int) -> None:
             else:
                 _, snap = await bridge.perform_action(arg_device, {"action": "tap", "node_id": 1})
                 assert snap is not None
-        elif op == "trigger_payment_takeover":
-            if dev_id in online_ids:
+        elif op == "show_authorized_page":
+            if dev_id in online_ids and not sim.takeover_reason:
                 sim.payment_page = True
                 snap = await bridge.observe(dev_id)
-                assert snap.takeover_reason is not None
-                assert snap.pip_state == "needs_you"
-                # 进入接管态后，普通点击必须被拦截
-                with pytest.raises(PhoneNodeError):
-                    await bridge.perform_action(dev_id, {"action": "tap", "node_id": 2})
+                assert snap.takeover_reason is None
+                assert snap.pip_state == "running"
+                await bridge.perform_action(dev_id, {"action": "tap", "node_id": 2})
         elif op == "hand_to_user":
             if dev_id in online_ids:
                 _, snap = await bridge.perform_action(
                     dev_id,
-                    {"action": "hand_to_user", "reason": "请输入支付密码"},
+                    {"action": "hand_to_user", "reason": "请用户检查选项"},
                 )
                 assert snap is not None
-                assert snap.takeover_reason == "请输入支付密码"
+                assert snap.takeover_reason == "请用户检查选项"
                 assert snap.pip_state == "needs_you"
         elif op == "resume_from_user":
             if dev_id in online_ids:

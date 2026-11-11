@@ -310,7 +310,7 @@ async def apply(ctx: Context) -> None:
         name="phone_observe",
         description=(
             "观察手机端后台虚拟屏幕（VirtualDisplay）当前的 Activity、结构化无障碍 UI 节点树（带 node_id 与中心坐标）"
-            "以及可选的实时截图。不打断用户在手机主屏幕上的聊天或打字。首次调用前先阅读 phone-use 技能。"
+            "以及可选的实时截图；可能初始化或唤醒虚拟屏。首次调用前先阅读 phone-use 技能。"
         ),
         parameters=PhoneObserveInput.model_json_schema(),
         open=lambda state: _open_observe(ctx, state),
@@ -323,7 +323,7 @@ async def apply(ctx: Context) -> None:
         description=(
             "在手机端后台虚拟屏幕（VirtualDisplay）上执行单步操作：启动应用（launch_app）、点击节点或坐标（tap）、"
             "输入文字（type_text，支持静默剪贴板粘贴并自动还原）、滚动（scroll）、滑动（swipe）、按键（press_key/back）、"
-            "打开链接（open_link）、分享文本（share_text）、遇到支付/验证码时移交手机主屏幕请用户操作（hand_to_user）"
+            "打开链接（open_link）、分享文本（share_text）、按用户要求移交手机主屏幕（hand_to_user）"
             "以及用户完成后收回后台虚拟屏幕（resume_from_user）。每次动作后返回更新后的虚拟屏快照。"
         ),
         parameters=PhoneActionInput.model_json_schema(),

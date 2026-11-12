@@ -91,12 +91,6 @@ class PhoneBridge:
         self._sessions: dict[str, _NodeSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._closing_transports: set[asyncio.Task[None]] = set()
-        self._connection_changed = asyncio.Event()
-
-    async def wait_connection_change(self) -> None:
-        """唤醒唯一 Turn follower；扫描期间的连接变化保留到下次扫描。"""
-        await self._connection_changed.wait()
-        self._connection_changed.clear()
 
     def list_devices(self) -> tuple[PhoneDeviceDescriptor, ...]:
         return tuple(
@@ -169,7 +163,6 @@ class PhoneBridge:
             connected_at=asyncio.get_running_loop().time(),
         )
         self._sessions[device_id] = session
-        self._connection_changed.set()
         logger.info(
             "phone.node.registered device=%s shell=%s ack=%s vd=%s",
             device_id, session.shell_version, session.supports_ack, vd_id,
@@ -252,7 +245,6 @@ class PhoneBridge:
         session.closed = True
         if self._sessions.get(session.device_id) is session:
             del self._sessions[session.device_id]
-            self._connection_changed.set()
         age = asyncio.get_running_loop().time() - session.connected_at
         logger.info("phone.node.closed device=%s reason=%s age_s=%.0f", session.device_id, reason, age)
         for fut in tuple(session.pending.values()):

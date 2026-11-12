@@ -19,7 +19,7 @@
 
 ## 配套版本与协议
 
-phone-use 0.3.0 需要 Akashic Shell 0.5.0 或更新版本，两端必须一起升级；`/api/phone/apk` 下发仓库内的 `akashic-shell-v0.5.0.apk`。
+phone-use 0.3.x 需要 Akashic Shell 0.5.0 或更新版本，两端必须一起升级；`/api/phone/apk` 下发仓库内的 `akashic-shell-v0.5.1.apk`（流量下也能重新拉起后台助手）。
 
 - **连接身份**：注册时服务端在 `welcome` 里下发 `connection_id`，端侧的 ACK、结果和状态回传都必须带上它；重连后旧连接的迟到回传返回 409，不会覆盖新状态。
 - **快照引用**：每次观察或动作返回 `snapshot_ref`。节点点击、`type_text`、`clear_text` 必须原样带回所属快照的引用，页面或连接变化后旧节点会被拒绝（`PHONE_SNAPSHOT_STALE`），需要重新观察。坐标点击不需要引用。

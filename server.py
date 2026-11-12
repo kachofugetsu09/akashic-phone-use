@@ -24,6 +24,8 @@ from .bridge import PhoneBridge, PhoneNodeError, _NodeSession
 logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = 10.0
 MIN_SHELL_VERSION = "0.5.0"
+# /api/phone/apk 下发的版本；可高于协议下限。
+BUNDLED_SHELL_VERSION = "0.5.1"
 
 
 class PhoneListenerServer(uvicorn.Server):
@@ -97,7 +99,7 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
 
     @app.get("/api/phone/apk")
     async def download_apk() -> FileResponse:
-        apk_name = f"akashic-shell-v{MIN_SHELL_VERSION}.apk"
+        apk_name = f"akashic-shell-v{BUNDLED_SHELL_VERSION}.apk"
         apk_path = plugin_dir / apk_name
         if not apk_path.is_file():
             raise HTTPException(status_code=404, detail=f"需要 Akashic Shell {MIN_SHELL_VERSION} 或更新版本；兼容的 release APK 尚未打包，请勿安装旧版 APK")

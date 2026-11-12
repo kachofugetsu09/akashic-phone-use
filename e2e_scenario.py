@@ -1,7 +1,7 @@
-"""真实 Agent 全链路 E2E 验收：
+"""隔离 Core 脚本集成场景（脚本模型与模拟节点，不是真实模型或真机验收）：
 1. Prompt Cache 零破坏验证（不调 load_tools 时模型请求 tools schema 不含 phone_*，且手机节点上下线不改变系统提示词与工具目录前缀）；
-2. 模拟 Android Shell 节点通过 WebSocket / Bridge 连入；
-3. Agent 依次执行 load_tools(plugin="phone-use") → phone_devices → phone_action(launch_app) → phone_action(type_text) → phone_action(tap 触发收银台接管) → phone_action(resume_from_user) → phone_observe(include_screenshot=True)；
+2. 模拟 Android Shell 节点直接接入 Bridge；
+3. Agent 依次执行 load_tools(plugin="phone-use") → phone_devices → phone_action(launch_app) → phone_action(type_text) → phone_action(hand_to_user) → phone_action(resume_from_user) → phone_observe(include_screenshot=True)；
 4. Turn 闭合后自动触发 finishDisplay 收尾虚拟屏幕，并将 owner_state 推进至 ended。
 """
 from __future__ import annotations
@@ -193,12 +193,12 @@ async def apply(ctx):
                 ])
             if phone_step == 5:
                 return LLMResponse(None, [
-                    ToolCall("p-tap", "tool_call", {
+                    ToolCall("p-handoff", "tool_call", {
                         "name": "phone_action",
                         "arguments": {
-                            "description": "点击付款按钮触发收银台接管护栏",
-                            "action": "tap",
-                            "node_id": 2,
+                            "description": "按用户要求移交主屏检查选项",
+                            "action": "hand_to_user",
+                            "reason": "请用户检查当前选项",
                         },
                     }),
                 ])
@@ -295,10 +295,10 @@ async def apply(ctx):
 
         # 2. 注册模拟的 Pixel 9 无线调试虚拟屏节点
         node_requests: list[dict[str, object]] = []
-        payment_stage = False
+        takeover_stage = False
 
         async def on_node_request(msg: dict[str, object]) -> None:
-            nonlocal payment_stage
+            nonlocal takeover_stage
             if msg.get("type") != "request":
                 return
             node_requests.append(msg)
@@ -314,16 +314,16 @@ async def apply(ctx):
                         "type": "response",
                         "request_id": req_id,
                         "ok": True,
-                        "result": {"kept": payload.get("keep", []), "closed": payload.get("close", [])},
+                        "result": {"kept": [], "closed": []},
                         "state": {"virtual_display_id": None, "pip_state": "done"},
                     },
                 )
                 return
 
-            if action == "tap" and payload.get("node_id") == 2:
-                payment_stage = True
+            if action == "hand_to_user":
+                takeover_stage = True
             elif action == "resume_from_user":
-                payment_stage = False
+                takeover_stage = False
 
             screen: dict[str, object] = {
                 "display_id": 2,
@@ -331,12 +331,9 @@ async def apply(ctx):
                 "height": 2400,
                 "rotation": 0,
                 "package_name": "com.tencent.mm",
-                "activity_name": (
-                    "com.tencent.mm.plugin.wallet.PayActivity"
-                    if payment_stage
-                    else "com.tencent.mm.ui.LauncherUI"
-                ),
-                "pip_state": "needs_you" if payment_stage else "running",
+                "activity_name": "com.tencent.mm.ui.LauncherUI",
+                "pip_state": "needs_you" if takeover_stage else "running",
+                "takeover_reason": "请用户检查当前选项" if takeover_stage else None,
                 "audio_muted": True,
                 "nodes": [
                     {
@@ -351,7 +348,7 @@ async def apply(ctx):
                     {
                         "node_id": 2,
                         "class_name": "android.widget.Button",
-                        "text": "立即支付" if payment_stage else "进入群聊",
+                        "text": "检查选项" if takeover_stage else "进入群聊",
                         "content_description": "",
                         "bounds": [700, 2000, 1020, 2140],
                         "clickable": True,

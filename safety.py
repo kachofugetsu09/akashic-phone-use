@@ -1,69 +1,9 @@
-"""端侧安全接管（Ask / Takeover）判定与 UI 节点树格式化。"""
+"""端侧 UI 节点解析与快照格式化。"""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
 from .contract import PhoneScreenSnapshot, PhoneUiNode
-
-# 支付收银台、指纹/密码认证、银行安全键盘与验证码页面的确定性识别规则。
-_SENSITIVE_ACTIVITY_KEYWORDS = (
-    "pay",
-    "cashier",
-    "checkout",
-    "wallet",
-    "biometric",
-    "keyguard",
-    "auth",
-    "verify",
-    "passcode",
-    "password",
-    "transfer",
-)
-
-_SENSITIVE_TEXT_KEYWORDS = (
-    "确认支付",
-    "立即支付",
-    "输入支付密码",
-    "支付密码",
-    "指纹支付",
-    "面容支付",
-    "确认转账",
-    "立即付款",
-    "安全验证",
-    "短信验证码",
-    "请输入验证码",
-    "滑块验证",
-    "手势密码",
-)
-
-
-def detect_takeover_reason(
-    *,
-    package_name: str,
-    activity_name: str,
-    nodes: Sequence[PhoneUiNode],
-    explicit_reason: str | None = None,
-    secure_window: bool = False,
-) -> str | None:
-    """识别需要把后台虚拟屏 App 移交主屏由用户本人完成的敏感场景。"""
-    if explicit_reason:
-        return explicit_reason
-    if secure_window:
-        return f"应用窗口标记了 FLAG_SECURE ({package_name}/{activity_name})，需用户在主屏幕接管操作"
-    lowered_activity = f"{package_name}/{activity_name}".lower()
-    for token in _SENSITIVE_ACTIVITY_KEYWORDS:
-        if token in lowered_activity:
-            for node in nodes:
-                combined = f"{node.text} {node.content_description}".strip()
-                for phrase in _SENSITIVE_TEXT_KEYWORDS:
-                    if phrase in combined:
-                        return f"检测到敏感页面【{phrase}】({package_name})，已挂起后台操作并请求主屏接管"
-    for node in nodes:
-        combined = f"{node.text} {node.content_description}".strip()
-        for phrase in ("输入支付密码", "确认支付", "立即支付", "确认转账", "指纹支付", "面容支付"):
-            if phrase in combined:
-                return f"检测到支付/转账确认控件【{phrase}】({package_name})，需用户在主屏幕亲自确认"
-    return None
 
 
 def parse_ui_nodes(raw_nodes: object) -> tuple[PhoneUiNode, ...]:
@@ -108,15 +48,21 @@ def parse_ui_nodes(raw_nodes: object) -> tuple[PhoneUiNode, ...]:
 def format_screen_snapshot(snapshot: PhoneScreenSnapshot) -> str:
     """将后台虚拟屏快照渲染为高信噪比、省 Token 的文本表示。"""
     header = [
+        f"Snapshot: snapshot_ref={snapshot.snapshot_ref}",
         f"Device: {snapshot.device_id} | VirtualDisplay: #{snapshot.display_id} ({snapshot.width}x{snapshot.height} rot={snapshot.rotation})",
-        f"Foreground: {snapshot.package_name}/{snapshot.activity_name} | PiP: {snapshot.pip_state} | AudioMuted: {snapshot.audio_muted}",
+        f"Foreground: {snapshot.package_name or 'unknown'}/{snapshot.activity_name or 'unknown'} | PiP: {snapshot.pip_state} | AudioMuted: {snapshot.audio_muted}",
     ]
     if snapshot.takeover_reason:
         header.append(f"TAKEOVER REQUIRED: {snapshot.takeover_reason}")
-        header.append("请告知用户在手机主屏或点击右下角橙色呼吸小窗完成操作，完成后再调用 resume_from_user 或 phone_observe。")
+        header.append("端侧已明确请求用户接管；可先观察状态，用户完成后调用 resume_from_user。")
+    if snapshot.secure_window:
+        header.append("CAPTURE LIMITED: 设备报告 FLAG_SECURE，截图可能受限；这不代表用户已请求接管。")
     lines = ["\n".join(header), "", "UI Elements:"]
     if not snapshot.nodes:
-        lines.append("  (no accessibility nodes; use include_screenshot=true or OCR)")
+        lines.append(
+            "  (no accessibility nodes)" if snapshot.secure_window
+            else "  (no accessibility nodes; use include_screenshot=true or OCR)"
+        )
     else:
         for node in snapshot.nodes:
             flags: list[str] = []

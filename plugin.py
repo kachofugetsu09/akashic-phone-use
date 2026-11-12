@@ -48,6 +48,10 @@ class PhoneCallIdentity:
     device_id: str
 
 
+class _TurnSuperseded(RuntimeError):
+    """设备已经交给另一个 Turn；旧 Turn 不能再释放它。"""
+
+
 def _parse_call_identity(arguments: Mapping[str, object], default_device: str) -> PhoneCallIdentity:
     value = arguments.get("_phone")
     if not isinstance(value, Mapping) or set(value) != {"session_id", "source", "turn_input_id"}:
@@ -82,10 +86,8 @@ class PhoneControl:
         key: str,
         control_binding: str,
         identity: PhoneCallIdentity,
-        *,
-        keep_packages: tuple[str, ...] = (),
-        close_packages: tuple[str, ...] = (),
     ) -> None:
+        """在设备发送锁内原子保存调用身份与最新 Turn 使用权。"""
         owner_key = "phone-use:" + key
         value: dict[str, object] = {
             "v": 1,
@@ -95,17 +97,27 @@ class PhoneControl:
             "source": identity.source,
             "turn_input_id": identity.turn_input_id,
             "device_id": identity.device_id,
-            "keep_packages": list(keep_packages),
-            "close_packages": list(close_packages),
         }
         state = self._state()
-        existing = await run_file_io(lambda: state.read(owner_key))
-        if existing is None:
-            _ = await state.transact_async(lambda tx: tx.save(owner_key, value, expected_version=None))
-        elif existing.value.get("phase") == "ended" and _same_record(existing.value, value):
-            raise RuntimeError("Phone 调用已经结束")
-        elif not _same_record(existing.value, value):
-            raise ValueError("Phone 调用回执身份不一致")
+
+        def claim(tx) -> None:
+            existing = tx.read(owner_key)
+            if existing is None:
+                _ = tx.save(owner_key, value, expected_version=None)
+            elif not _same_record(existing.value, value):
+                raise ValueError("Phone 调用回执身份不一致")
+            elif existing.value.get("phase") != "started":
+                raise RuntimeError("Phone 调用已经结束或收尾结果未知")
+            # 此回执仅表示当前设备使用权；不改写任何既有调用的身份或结果。
+            device_key = "phone-device:" + identity.device_id
+            current = tx.read(device_key)
+            _ = tx.save(device_key, {
+                "v": 1, "control_binding": control_binding,
+                "session_id": identity.session_id, "source": identity.source,
+                "turn_input_id": identity.turn_input_id, "device_id": identity.device_id,
+            }, expected_version=current.version if current else None)
+
+        await state.transact_async(claim)
 
     async def observe(
         self,
@@ -116,11 +128,11 @@ class PhoneControl:
         requested_device = cast(str | None, arguments.get("device_id"))
         device_id = self.bridge.resolve_device_id(requested_device)
         identity = _parse_call_identity(arguments, device_id)
-        await self._record_started(key, control_binding, identity)
         return await self.bridge.observe(
             device_id,
             include_screenshot=bool(arguments.get("include_screenshot", False)),
             timeout_ms=int(arguments.get("timeout_ms", 20_000)),
+            before_send=lambda: self._record_started(key, control_binding, identity),
         )
 
     async def action(
@@ -132,38 +144,33 @@ class PhoneControl:
         requested_device = cast(str | None, arguments.get("device_id"))
         device_id = self.bridge.resolve_device_id(requested_device)
         identity = _parse_call_identity(arguments, device_id)
-        keep = tuple(str(x) for x in cast(list[object], arguments.get("keep_packages", [])) if isinstance(x, str))
-        close = tuple(str(x) for x in cast(list[object], arguments.get("close_packages", [])) if isinstance(x, str))
-        await self._record_started(
-            key,
-            control_binding,
-            identity,
-            keep_packages=keep,
-            close_packages=close,
-        )
         payload = {k: v for k, v in arguments.items() if k != "_phone" and v is not None}
         return await self.bridge.perform_action(
             device_id,
             payload,
             timeout_ms=int(arguments.get("timeout_ms", 30_000)),
+            before_send=lambda: self._record_started(key, control_binding, identity),
         )
 
-    async def end_turn(
-        self,
-        device_id: str,
-        *,
-        keep_packages: tuple[str, ...] = (),
-        close_packages: tuple[str, ...] = (),
-    ) -> None:
+    # 仅当前 Turn 可收尾：设备已被新 Turn 占用时不发送 finish，避免释放它正在用的屏幕。
+    async def end_turn(self, identity: PhoneCallIdentity) -> None:
+        state = self._state()
+        device_key = "phone-device:" + identity.device_id
+        expected = (identity.session_id, identity.source, identity.turn_input_id)
+
+        # owner 检查在设备发送锁内执行，与新 Turn 的 claim 串行。
+        async def check_owner() -> None:
+            current = await run_file_io(lambda: state.read(device_key))
+            if current is None:
+                return
+            actual = tuple(current.value.get(field) for field in ("session_id", "source", "turn_input_id"))
+            if actual != expected:
+                raise _TurnSuperseded("设备已由新 Turn 使用；旧 Turn 不发送收尾")
+
         try:
-            _ = await self.bridge.finish_display(
-                device_id,
-                keep_packages=keep_packages,
-                close_packages=close_packages,
-                reason="turn_ended",
-            )
-        except PhoneNodeError:
-            # 手机端已在 Turn 闭合前离线时，端侧本地 watchdog 会自行释放虚拟屏，不阻塞账本收尾。
+            _ = await self.bridge.finish_display(identity.device_id, reason="turn_ended", before_send=check_owner)
+        except (_TurnSuperseded, PhoneNodeError):
+            # 被接替或手机离线时不重试收尾，下一次使用会复用同一块后台显示器。
             pass
 
 
@@ -233,7 +240,7 @@ class _PhoneActionTool:
 
 api_version = 3
 name = "phone-use"
-version = "0.1.1"
+version = "0.3.0"
 desc = "连接并后台操作在线的 Android 手机端侧设备（无线调试虚拟屏、悬浮小窗预览、读屏与接管）"
 author = "Akashic"
 inject = (
@@ -310,7 +317,7 @@ async def apply(ctx: Context) -> None:
         name="phone_observe",
         description=(
             "观察手机端后台虚拟屏幕（VirtualDisplay）当前的 Activity、结构化无障碍 UI 节点树（带 node_id 与中心坐标）"
-            "以及可选的实时截图。不打断用户在手机主屏幕上的聊天或打字。首次调用前先阅读 phone-use 技能。"
+            "以及可选的实时截图；可能初始化或唤醒虚拟屏。首次调用前先阅读 phone-use 技能。"
         ),
         parameters=PhoneObserveInput.model_json_schema(),
         open=lambda state: _open_observe(ctx, state),
@@ -322,9 +329,9 @@ async def apply(ctx: Context) -> None:
         name="phone_action",
         description=(
             "在手机端后台虚拟屏幕（VirtualDisplay）上执行单步操作：启动应用（launch_app）、点击节点或坐标（tap）、"
-            "输入文字（type_text，支持静默剪贴板粘贴并自动还原）、滚动（scroll）、滑动（swipe）、按键（press_key/back）、"
-            "打开链接（open_link）、分享文本（share_text）、遇到支付/验证码时移交手机主屏幕请用户操作（hand_to_user）"
-            "以及用户完成后收回后台虚拟屏幕（resume_from_user）。每次动作后返回更新后的虚拟屏快照。"
+            "设置输入框全文（type_text，覆盖原有内容，无需先清空；需检查字段内容）、滚动（scroll）、滑动（swipe）、按键（press_key/back）、"
+            "打开链接（open_link）、分享文本（share_text）、按用户要求移交手机主屏幕（hand_to_user）"
+            "以及用户完成后收回后台虚拟屏幕（resume_from_user）。每次动作后返回更新后的虚拟屏快照；节点点击和文字输入须原样携带所属快照的 snapshot_ref。"
         ),
         parameters=PhoneActionInput.model_json_schema(),
         open=lambda state: _open_action(ctx, state),
@@ -424,21 +431,16 @@ async def _try_end(
         for turn in turns
     ):
         return False
-    keep: list[str] = []
-    close: list[str] = []
-    for _, rec in records:
-        for pkg in cast(list[object], rec.value.get("keep_packages", [])):
-            if isinstance(pkg, str) and pkg not in keep:
-                keep.append(pkg)
-        for pkg in cast(list[object], rec.value.get("close_packages", [])):
-            if isinstance(pkg, str) and pkg not in close:
-                close.append(pkg)
+    # v1 回执可能含旧 keep/close 列表；保留原数据，但它们不再决定整屏收尾。
     binding = cast(str, value["control_binding"])
     device_id = cast(str, value["device_id"])
     bindings = ctx.require(BINDINGS)
     try:
         async with bindings.open(binding, PHONE_CONTROL) as (bound, _):
-            await bound.end_turn(device_id, keep_packages=tuple(keep), close_packages=tuple(close))
+            await bound.end_turn(
+                PhoneCallIdentity(cast(str, value["session_id"]), cast(str, value["source"]),
+                                  cast(str, value["turn_input_id"]), device_id),
+            )
     except (KeyError, ValueError) as error:
         await _mark_records(ctx, records, phase="failed", error=f"phone control binding 不可用: {error}")
         return True

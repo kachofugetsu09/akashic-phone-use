@@ -56,15 +56,19 @@ class PhoneActionInput(BaseModel):
     action: PhoneActionKind = Field(
         description=(
             "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 node_id 或 x/y 点击）、"
-            "type_text（向输入框或聚焦控件输入文本，支持静默剪贴板粘贴并自动还原）、"
+            "type_text（设置输入框全文，覆盖原有内容，无需先清空；需检查返回结果与字段内容）、"
             "clear_text、scroll（up/down/left/right）、swipe、press_key、back、"
-            "open_link、share_text、wait、hand_to_user（将应用移交手机主屏幕请用户本人操作支付/验证）、"
+            "open_link、share_text、wait、hand_to_user（按用户要求将应用移交手机主屏幕）、"
             "resume_from_user（用户完成主屏幕操作后收回后台虚拟屏继续）。"
         )
     )
     device_id: str | None = Field(default=None, min_length=1, max_length=128)
     package_name: str | None = Field(default=None, min_length=1, max_length=256)
     node_id: int | None = Field(default=None, ge=1)
+    snapshot_ref: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        description="节点所属快照的 snapshot_ref，原样复制最近一次工具返回值；节点点击及 type_text/clear_text 必填，不能从旧快照借用。",
+    )
     x: int | None = Field(default=None, ge=0, le=10_000)
     y: int | None = Field(default=None, ge=0, le=10_000)
     end_x: int | None = Field(default=None, ge=0, le=10_000)
@@ -79,19 +83,13 @@ class PhoneActionInput(BaseModel):
         default=False,
         description="动作执行后是否附带最新一帧后台虚拟屏 PNG 截图。",
     )
-    keep_packages: list[str] = Field(
-        default_factory=list,
-        description="任务收尾时保留在系统后台最近任务中的应用包名列表。",
-    )
-    close_packages: list[str] = Field(
-        default_factory=list,
-        description="任务收尾时关闭并停止发声的应用包名列表。",
-    )
     timeout_ms: int = Field(default=30_000, ge=100, le=110_000)
 
     @model_validator(mode="after")
     def _validate_action_fields(self) -> PhoneActionInput:
         act = self.action
+        if (act in ("type_text", "clear_text") or (act == "tap" and self.node_id is not None)) and not self.snapshot_ref:
+            raise ValueError("节点操作必须提供所属快照的 snapshot_ref；请先观察，不自动使用最新引用")
         if act == "launch_app" and not self.package_name:
             raise ValueError("launch_app 必须提供 package_name")
         if act == "tap" and self.node_id is None and (self.x is None or self.y is None):
@@ -109,7 +107,7 @@ class PhoneActionInput(BaseModel):
         if act == "share_text" and (not self.package_name or not self.text):
             raise ValueError("share_text 必须同时提供 package_name 与 text")
         if act == "hand_to_user" and not self.reason:
-            raise ValueError("hand_to_user 必须提供 reason 说明需要用户亲自处理的原因")
+            raise ValueError("hand_to_user 必须提供 reason 说明移交原因")
         return self
 
 

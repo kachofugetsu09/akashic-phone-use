@@ -51,17 +51,19 @@ class PhoneScreenSnapshot:
     """一次端侧观察返回的虚拟屏状态、UI 树与可选 PNG 帧。"""
 
     device_id: str
+    snapshot_ref: str
     display_id: int
     width: int
     height: int
     rotation: int
-    package_name: str
+    package_name: str  # 空串表示本次观察无法确定。
     activity_name: str
     pip_state: PhonePipState
     audio_muted: bool
     nodes: tuple[PhoneUiNode, ...]
     screenshot_png: bytes | None = None
     takeover_reason: str | None = None
+    secure_window: bool = False
 
 
 @dataclass(frozen=True, slots=True)

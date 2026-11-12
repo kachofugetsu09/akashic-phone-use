@@ -13,15 +13,17 @@ from typing import cast
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.websockets import WebSocketState
+from starlette.types import Receive, Scope, Send
 import uvicorn
 
 from agent.plugin_composition import Context
 from core.common.unix_socket import prepare_unix_socket, socket_alias_path
 
-from .bridge import PhoneBridge
+from .bridge import PhoneBridge, PhoneNodeError, _NodeSession
 
 logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = 10.0
+MIN_SHELL_VERSION = "0.5.0"
 
 
 class PhoneListenerServer(uvicorn.Server):
@@ -66,6 +68,24 @@ class PhoneListenerServer(uvicorn.Server):
             should_exit = await self.on_tick(counter)
 
 
+class _PhoneStreamResponse(StreamingResponse):
+    """HTTP 响应拥有节点连接寿命，包括响应体尚未开始时的取消。"""
+
+    def __init__(self, content: AsyncGenerator[bytes, None], bridge: PhoneBridge, session: _NodeSession) -> None:
+        super().__init__(
+            content, media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+        self._bridge = bridge
+        self._session = session
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._bridge.unregister_node(self._session)
+
+
 def _sse_event(name: str, payload: dict[str, object]) -> bytes:
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return f"event: {name}\ndata: {data}\n\n".encode("utf-8")
@@ -77,13 +97,14 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
 
     @app.get("/api/phone/apk")
     async def download_apk() -> FileResponse:
-        apk_path = plugin_dir / "akashic-shell-v0.3.4.apk"
+        apk_name = f"akashic-shell-v{MIN_SHELL_VERSION}.apk"
+        apk_path = plugin_dir / apk_name
         if not apk_path.is_file():
-            raise HTTPException(status_code=404, detail="APK 尚未构建")
+            raise HTTPException(status_code=404, detail=f"需要 Akashic Shell {MIN_SHELL_VERSION} 或更新版本；兼容的 release APK 尚未打包，请勿安装旧版 APK")
         return FileResponse(
             apk_path,
             media_type="application/vnd.android.package-archive",
-            filename="akashic-shell-v0.3.4.apk",
+            filename=apk_name,
         )
 
     @app.get("/api/phone/devices")
@@ -116,6 +137,8 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
             raise HTTPException(status_code=400, detail="无效的 JSON hello 载荷") from error
         if not isinstance(hello, dict) or hello.get("type") != "hello":
             raise HTTPException(status_code=400, detail="首包必须是 type=hello")
+        if hello.get("supports_connection_id") is not True:
+            raise HTTPException(status_code=400, detail=f"SSE 端侧必须支持 connection_id，请升级 Akashic Shell 至 {MIN_SHELL_VERSION} 或更新版本")
 
         queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
 
@@ -135,30 +158,21 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
         async def events() -> AsyncGenerator[bytes, None]:
-            try:
-                yield _sse_event("welcome", {"device_id": session.device_id})
-                while not session.closed:
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
-                    except TimeoutError:
-                        if await request.is_disconnected():
-                            break
-                        yield _sse_event("heartbeat", {})
-                        continue
-                    if item is None:
+            yield _sse_event("welcome", {"device_id": session.device_id, "connection_id": session.connection_id})
+            while not session.closed:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    if await request.is_disconnected():
                         break
-                    event_name = str(item.get("type") or "message")
-                    yield _sse_event(event_name, item)
-            except asyncio.CancelledError:
-                raise
-            finally:
-                await bridge.unregister_node(session)
+                    yield _sse_event("heartbeat", {})
+                    continue
+                if item is None:
+                    break
+                event_name = str(item.get("type") or "message")
+                yield _sse_event(event_name, item)
 
-        return StreamingResponse(
-            events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
-        )
+        return _PhoneStreamResponse(events(), bridge, session)
 
     @app.post("/api/phone/reply")
     async def node_http_reply(request: Request) -> JSONResponse:
@@ -172,7 +186,13 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
         device_id = str(frame.get("device_id") or "").strip()
         if not device_id:
             raise HTTPException(status_code=400, detail="缺少 device_id")
-        accepted = bridge.handle_incoming_for_device(device_id, cast(dict[str, object], frame))
+        connection_id = frame.get("connection_id")
+        if not isinstance(connection_id, str) or not connection_id or len(connection_id) > 128:
+            raise HTTPException(status_code=409, detail="HTTP 回传必须携带当前 welcome 的 connection_id")
+        try:
+            accepted = bridge.handle_incoming_for_device(device_id, cast(dict[str, object], frame))
+        except PhoneNodeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         if not accepted:
             raise HTTPException(status_code=404, detail=f"设备 {device_id!r} 未注册或连接已断开")
         return JSONResponse({"ok": True})
@@ -183,12 +203,20 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
         session = None
 
         async def send_json(payload: dict[str, object]) -> None:
-            if websocket.client_state is WebSocketState.CONNECTED:
+            """发送帧，并在传输边界将断连转换成桥接错误。"""
+            if (
+                websocket.client_state is not WebSocketState.CONNECTED
+                or websocket.application_state is not WebSocketState.CONNECTED
+            ):
+                raise PhoneNodeError("WebSocket 连接已断开")
+            try:
                 await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+            except WebSocketDisconnect as exc:
+                raise PhoneNodeError(f"WebSocket 发送失败（断连码 {exc.code}）") from exc
 
         async def close_transport() -> None:
             if websocket.client_state is WebSocketState.CONNECTED:
-                with suppress(RuntimeError, OSError):
+                with suppress(RuntimeError, OSError, WebSocketDisconnect):
                     await websocket.close(code=1000)
 
         try:
@@ -197,12 +225,15 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
             if not isinstance(hello, dict) or hello.get("type") != "hello":
                 await websocket.close(code=1008, reason="首帧必须是 hello")
                 return
+            if hello.get("supports_snapshot_ref") is not True:
+                await websocket.close(code=1008, reason="Upgrade Akashic Shell to 0.5.0: snapshot_ref required")
+                return
             session = await bridge.register_node(
                 cast(dict[str, object], hello),
                 send_json=send_json,
                 close_transport=close_transport,
             )
-            await send_json({"type": "welcome", "device_id": session.device_id})
+            await send_json({"type": "welcome", "device_id": session.device_id, "connection_id": session.connection_id})
             while True:
                 raw = await websocket.receive_text()
                 frame = json.loads(raw)
@@ -211,7 +242,7 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
                         await send_json({"type": "pong", "ts": frame.get("ts")})
                     else:
                         bridge.handle_incoming(session, cast(dict[str, object], frame))
-        except (WebSocketDisconnect, TimeoutError, ValueError, OSError):
+        except (WebSocketDisconnect, PhoneNodeError, TimeoutError, ValueError, OSError):
             pass
         finally:
             if session is not None:

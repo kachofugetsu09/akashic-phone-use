@@ -87,10 +87,18 @@ def _valid_pip_state(value: object) -> PhonePipState:
 class PhoneBridge:
     """维护在线 Android Shell 节点会话，按设备串行分发端侧指令。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_registered: Callable[[_NodeSession], None] | None = None) -> None:
         self._sessions: dict[str, _NodeSession] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._closing_transports: set[asyncio.Task[None]] = set()
+        self._on_registered = on_registered
+
+    def set_on_registered(self, callback: Callable[[_NodeSession], None] | None) -> None:
+        self._on_registered = callback
+
+    def current_session(self, device_id: str) -> _NodeSession | None:
+        session = self._sessions.get(device_id)
+        return None if session is None or session.closed else session
 
     def list_devices(self) -> tuple[PhoneDeviceDescriptor, ...]:
         return tuple(
@@ -167,6 +175,8 @@ class PhoneBridge:
             "phone.node.registered device=%s shell=%s ack=%s vd=%s",
             device_id, session.shell_version, session.supports_ack, vd_id,
         )
+        if self._on_registered is not None:
+            self._on_registered(session)
         return session
 
     def handle_incoming(self, session: _NodeSession, frame: Mapping[str, object]) -> None:

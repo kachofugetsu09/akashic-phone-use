@@ -1,6 +1,7 @@
 """Phone 端侧能力外置插件（phone-use）：按需加载（load_tools）、无线调试后台虚拟屏控制与 Turn 级生命周期。"""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -17,7 +18,11 @@ from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     OWNER_STATE,
     ContentPart,
+    Control,
+    Input,
+    Message,
     MessageCatalog,
+    Output,
     OwnerRecord,
     OwnerStore,
     json_value,
@@ -284,7 +289,15 @@ async def _open_action(ctx: Context, state: Mapping[str, object]) -> AsyncIterat
 async def apply(ctx: Context) -> None:
     """注册按需加载的 Phone 工具组、无线调试 Bridge 监听器与 Turn 收尾跟随器。"""
     await ctx.require(INSTALLED_ASSETS).register(ctx, "skills", "skills")
-    bridge = PhoneBridge()
+    wake_reconcile = asyncio.Event()
+    pending_reconcile: dict[str, str] = {}
+
+    def on_node_registered(session) -> None:
+        if session.virtual_display_id is not None or session.pip_state in ("running", "needs_you"):
+            pending_reconcile[session.device_id] = session.connection_id
+            wake_reconcile.set()
+
+    bridge = PhoneBridge(on_registered=on_node_registered)
     control = PhoneControl(ctx, bridge)
     _ = await ctx.provide(PHONE_BRIDGE, bridge)
     _ = await ctx.provide(PHONE_CONTROL, control)
@@ -340,19 +353,67 @@ async def apply(ctx: Context) -> None:
     )
 
     async def start_follower(_event: object) -> None:
-        _ = await ctx.spawn(_start_follower(ctx), name="phone-turn-follower")
+        _ = await ctx.spawn(
+            _start_follower(ctx, bridge, wake_reconcile, pending_reconcile),
+            name="phone-turn-follower",
+        )
 
     _ = await ctx.on(RUNTIME_STARTED, start_follower)
 
 
-async def _start_follower(ctx: Context) -> None:
-    """扫描 started phone-use 记录，等待源 Message Turn 闭合后自动通知手机端收尾虚拟屏幕。"""
+def _turn_closed(
+    snapshot: tuple[Message, ...],
+    source: str,
+    turn_input_id: str,
+    projection: TurnProjection,
+) -> bool:
+    """TurnProjection 闭合，或源 Input 之后出现未恢复的 failure/pause/abandon 控制帧即视为已结束。"""
+    turns = projection.project(snapshot, source)
+    if any(
+        turn.status in {"complete", "quiet", "abandoned"}
+        and turn_input_id in turn.message_ids
+        for turn in turns
+    ):
+        return True
+    input_seq = next(
+        (
+            message.seq
+            for message in snapshot
+            if message.source == source and message.message_id == turn_input_id
+        ),
+        None,
+    )
+    if input_seq is None:
+        return False
+    failed = False
+    paused = False
+    for message in snapshot:
+        if message.source != source or message.seq <= input_seq:
+            continue
+        body = message.body
+        if isinstance(body, Control):
+            if body.action in {"failure", "abandon"}:
+                failed = True
+            elif body.action == "pause":
+                paused = True
+            elif body.action == "resume":
+                paused = False
+    return failed or paused
+
+
+async def _start_follower(
+    ctx: Context,
+    bridge: PhoneBridge,
+    wake_reconcile: asyncio.Event,
+    pending_reconcile: dict[str, str],
+) -> None:
+    """扫描 started phone-use 记录与新接入设备，源 Turn 闭合/失败/暂停或无主残留时收尾虚拟屏幕。"""
     catalog = ctx.require(MESSAGE_CATALOG)
     projection = ctx.require(TURN_PROJECTION)
     state: OwnerStore | None = None
     checked: dict[tuple[str, str, str, str, str], int] = {}
 
-    async def once() -> None:
+    async def once() -> set[str]:
         nonlocal state
         if state is None:
             state = ctx.require(OWNER_STATE).open(ctx)
@@ -373,31 +434,101 @@ async def _start_follower(ctx: Context) -> None:
         for group in tuple(checked):
             if group not in groups:
                 del checked[group]
+        active_devices: set[str] = set()
         for group, records in groups.items():
             session_id = group[1]
+            device_id = group[4]
             head = (
                 await run_file_io(catalog.reader(session_id).head)
                 if isinstance(session_id, str) and session_id
                 else -1
             )
             if checked.get(group) == head:
+                if isinstance(device_id, str) and device_id:
+                    active_devices.add(device_id)
                 continue
             async with ctx.runtime_scope():
-                closed = await _try_end(ctx, catalog, projection, records, through_seq=head)
+                closed = await _try_end(ctx, bridge, catalog, projection, records, through_seq=head)
             if closed:
                 _ = checked.pop(group, None)
             else:
                 checked[group] = head
+                if isinstance(device_id, str) and device_id:
+                    active_devices.add(device_id)
+        return active_devices
+
+    async def reconcile_orphaned(active_devices: set[str]) -> None:
+        if state is None:
+            return
+        targets = dict(pending_reconcile)
+        pending_reconcile.clear()
+        for descriptor in bridge.list_devices():
+            if descriptor.virtual_display_id is not None or descriptor.pip_state in ("running", "needs_you"):
+                session = bridge.current_session(descriptor.device_id)
+                if session is not None:
+                    targets.setdefault(descriptor.device_id, session.connection_id)
+        for device_id, expected_conn_id in targets.items():
+            if device_id in active_devices:
+                continue
+
+            async def check_still_orphaned(
+                target_device: str = device_id,
+                target_conn: str = expected_conn_id,
+            ) -> None:
+                session = bridge.current_session(target_device)
+                if session is None or session.connection_id != target_conn:
+                    raise _TurnSuperseded("连接已切换")
+                assert state is not None
+                for key, record in await run_file_io(state.list):
+                    if (
+                        key.startswith("phone-use:")
+                        and record.value.get("phase") == "started"
+                        and record.value.get("device_id") == target_device
+                    ):
+                        raise _TurnSuperseded("已有新 Turn 接管设备")
+
+            try:
+                async with ctx.runtime_scope():
+                    _ = await bridge.finish_display(
+                        device_id,
+                        reason="orphaned_display_cleanup",
+                        before_send=check_still_orphaned,
+                    )
+            except (_TurnSuperseded, PhoneNodeError):
+                pass
 
     async with ctx.runtime_scope():
-        await once()
-    async for _heads in catalog.follow():
-        async with ctx.runtime_scope():
-            await once()
+        active = await once()
+        await reconcile_orphaned(active)
+
+    follow_iter = catalog.follow().__aiter__()
+    follow_task = asyncio.create_task(follow_iter.__anext__(), name="phone-follow-next")
+    wake_task = asyncio.create_task(wake_reconcile.wait(), name="phone-wake-wait")
+    try:
+        while True:
+            done, _ = await asyncio.wait((follow_task, wake_task), return_when=asyncio.FIRST_COMPLETED)
+            if follow_task in done:
+                try:
+                    _ = follow_task.result()
+                except StopAsyncIteration:
+                    break
+                follow_task = asyncio.create_task(follow_iter.__anext__(), name="phone-follow-next")
+            if wake_task in done:
+                wake_reconcile.clear()
+                wake_task = asyncio.create_task(wake_reconcile.wait(), name="phone-wake-wait")
+            async with ctx.runtime_scope():
+                active = await once()
+                await reconcile_orphaned(active)
+    finally:
+        for t in (follow_task, wake_task):
+            if not t.done():
+                _ = t.cancel()
+        _ = await asyncio.gather(follow_task, wake_task, return_exceptions=True)
 
 
 async def _try_end(
     ctx: Context,
+    bridge: PhoneBridge,
     catalog: MessageCatalog,
     projection: TurnProjection,
     records: list[tuple[str, OwnerRecord]],
@@ -419,31 +550,40 @@ async def _try_end(
         await _mark_records(ctx, records, phase="failed", error="Phone owner record 字段无效")
         return True
     reader = catalog.reader(cast(str, value["session_id"]))
-    turns = await run_file_io(
-        lambda: projection.project(
+    source = cast(str, value["source"])
+    turn_input_id = cast(str, value["turn_input_id"])
+    closed = await run_file_io(
+        lambda: _turn_closed(
             tuple(reader.committed_snapshot(through_seq=through_seq)),
-            cast(str, value["source"]),
+            source,
+            turn_input_id,
+            projection,
         )
     )
-    if not any(
-        turn.status in {"complete", "quiet", "abandoned"}
-        and cast(str, value["turn_input_id"]) in turn.message_ids
-        for turn in turns
-    ):
+    if not closed:
         return False
     # v1 回执可能含旧 keep/close 列表；保留原数据，但它们不再决定整屏收尾。
     binding = cast(str, value["control_binding"])
     device_id = cast(str, value["device_id"])
+    identity = PhoneCallIdentity(
+        cast(str, value["session_id"]),
+        source,
+        turn_input_id,
+        device_id,
+    )
     bindings = ctx.require(BINDINGS)
     try:
         async with bindings.open(binding, PHONE_CONTROL) as (bound, _):
-            await bound.end_turn(
-                PhoneCallIdentity(cast(str, value["session_id"]), cast(str, value["source"]),
-                                  cast(str, value["turn_input_id"]), device_id),
-            )
-    except (KeyError, ValueError) as error:
-        await _mark_records(ctx, records, phase="failed", error=f"phone control binding 不可用: {error}")
-        return True
+            await bound.end_turn(identity)
+    except (KeyError, ValueError):
+        try:
+            await ctx.require(PHONE_CONTROL).end_turn(identity)
+        except Exception as error:
+            ctx.report_incident("phone-end-turn", f"{key}: {error}")
+            try:
+                _ = await bridge.finish_display(device_id, reason="turn_ended_fallback")
+            except PhoneNodeError:
+                pass
     except Exception as error:
         ctx.report_incident("phone-end-turn", f"{key}: {error}")
         return True

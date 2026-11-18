@@ -242,7 +242,7 @@ class PhoneControl:
         if self.bridge.supports_tree_v2(device_id):
             return
         if "node_id" in payload or "selector" in payload or payload.get("action") in ("type_text", "clear_text"):
-            raise PhoneNodeError("当前 Akashic Shell 版本过旧，不支持新的元素定位；请升级 Shell 至 0.5.3")
+            raise PhoneNodeError("当前 Akashic Shell 版本过旧，不支持新的元素定位；请升级 Shell 至 0.5.4")
 
     async def _resolve_app(self, device_id: str, step: Mapping[str, object]) -> Mapping[str, object]:
         app = step.get("app")
@@ -251,7 +251,7 @@ class PhoneControl:
         if not self.bridge.supports_apps(device_id):
             if "." in app and " " not in app.strip():
                 return {**step, "package_name": app.strip()}
-            raise ValueError("当前 Akashic Shell 不支持按应用名打开，请提供包名或升级 Shell 至 0.5.3")
+            raise ValueError("当前 Akashic Shell 不支持按应用名打开，请提供包名或升级 Shell 至 0.5.4")
         try:
             package = resolve_app(await self.bridge.launcher_apps(device_id), app)
         except ValueError:
@@ -373,7 +373,7 @@ class _PhoneActionTool:
 
 api_version = 3
 name = "phone-use"
-version = "0.4.2"
+version = "0.4.3"
 desc = "连接并后台操作在线的 Android 手机端侧设备（无线调试虚拟屏、悬浮小窗预览、读屏与接管）"
 author = "Akashic"
 inject = (

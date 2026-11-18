@@ -41,7 +41,7 @@ class PhoneObserveInput(BaseModel):
     )
     include_screenshot: bool = Field(
         default=False,
-        description="是否同时抓取后台虚拟屏当前 PNG 截图并存为图像附件（无障碍树不足以判断或需看图时设为 true）。",
+        description="强制附上截图。默认不需要：界面读不到控件文字时会自动附图，只有要看颜色、图片、布局等视觉细节时才设 true。",
     )
     timeout_ms: int = Field(default=20_000, ge=100, le=110_000)
 
@@ -55,7 +55,7 @@ class PhoneActionInput(BaseModel):
     )
     action: PhoneActionKind = Field(
         description=(
-            "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 node_id 或 x/y 点击）、"
+            "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 target 点击，界面读不到控件时才用 x/y）、"
             "type_text（设置输入框全文，覆盖原有内容，无需先清空；需检查返回结果与字段内容）、"
             "clear_text、scroll（up/down/left/right）、swipe、press_key、back、"
             "open_link、share_text、wait、hand_to_user（按用户要求将应用移交手机主屏幕）、"
@@ -64,11 +64,16 @@ class PhoneActionInput(BaseModel):
     )
     device_id: str | None = Field(default=None, min_length=1, max_length=128)
     package_name: str | None = Field(default=None, min_length=1, max_length=256)
-    node_id: int | None = Field(default=None, ge=1)
-    snapshot_ref: str | None = Field(
-        default=None, min_length=1, max_length=128,
-        description="节点所属快照的 snapshot_ref，原样复制最近一次工具返回值；节点点击及 type_text/clear_text 必填，不能从旧快照借用。",
+    target: str | None = Field(
+        default=None, min_length=1, max_length=200,
+        description=(
+            '要操作的元素：快照里的 "@12"（同一控件跨快照不变，可直接沿用）、可见文字如 "我的"'
+            '（忽略大小写的子串匹配；两端再加一层引号则精确匹配）、或 "id=search_box"（resource-id）。'
+            "tap / type_text / clear_text / scroll 可用；匹配到多个时会列出候选。"
+        ),
     )
+    node_id: int | None = Field(default=None, ge=1, description="旧写法，等同 target=\"@node_id\"。")
+    snapshot_ref: str | None = Field(default=None, min_length=1, max_length=128, description="已不需要，可省略。")
     x: int | None = Field(default=None, ge=0, le=10_000)
     y: int | None = Field(default=None, ge=0, le=10_000)
     end_x: int | None = Field(default=None, ge=0, le=10_000)
@@ -88,12 +93,14 @@ class PhoneActionInput(BaseModel):
     @model_validator(mode="after")
     def _validate_action_fields(self) -> PhoneActionInput:
         act = self.action
-        if (act in ("type_text", "clear_text") or (act == "tap" and self.node_id is not None)) and not self.snapshot_ref:
-            raise ValueError("节点操作必须提供所属快照的 snapshot_ref；请先观察，不自动使用最新引用")
+        if self.target is not None and self.node_id is not None:
+            raise ValueError("target 与 node_id 只能二选一")
+        if self.target is not None:
+            _ = parse_target(self.target)
         if act == "launch_app" and not self.package_name:
             raise ValueError("launch_app 必须提供 package_name")
-        if act == "tap" and self.node_id is None and (self.x is None or self.y is None):
-            raise ValueError("tap 必须提供 node_id 或同时提供 (x, y) 坐标")
+        if act == "tap" and self.target is None and self.node_id is None and (self.x is None or self.y is None):
+            raise ValueError("tap 必须提供 target，或在界面读不到控件时同时提供 (x, y) 坐标")
         if act == "type_text" and (self.text is None or self.text == ""):
             raise ValueError("type_text 必须提供非空 text")
         if act == "scroll" and self.direction is None:
@@ -109,6 +116,25 @@ class PhoneActionInput(BaseModel):
         if act == "hand_to_user" and not self.reason:
             raise ValueError("hand_to_user 必须提供 reason 说明移交原因")
         return self
+
+
+def parse_target(target: str) -> dict[str, object]:
+    """把 target 写法转成端侧线格式：@编号走 node_id，其余走语义 selector。"""
+    raw = target.strip()
+    if raw.startswith("@") and raw[1:].isdigit() and int(raw[1:]) > 0:
+        return {"node_id": int(raw[1:])}
+    if raw.startswith("id="):
+        resource_id = raw[3:].strip()
+        if not resource_id:
+            raise ValueError("id= 后面需要资源名")
+        return {"selector": {"resource_id": resource_id}}
+    text = raw[5:].strip() if raw.startswith("text=") else raw
+    exact = len(text) >= 2 and text[0] == text[-1] and text[0] in ("\"", "'")
+    if exact:
+        text = text[1:-1]
+    if not text:
+        raise ValueError("target 不能为空")
+    return {"selector": {"text": text, "exact": exact}}
 
 
 def extract_turn_identity(

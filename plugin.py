@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -203,7 +203,11 @@ class PhoneControl:
         device_id = self.bridge.resolve_device_id(requested_device)
         identity = _parse_call_identity(arguments, device_id)
         raw_steps = arguments.get("steps")
-        steps = cast(list[Mapping[str, object]], raw_steps) if isinstance(raw_steps, list) else [arguments]
+        # 参数经调用回执冻结后列表可能变成元组，按序列判断。
+        steps = (
+            list(cast(Sequence[Mapping[str, object]], raw_steps))
+            if isinstance(raw_steps, Sequence) and not isinstance(raw_steps, (str, bytes)) else [arguments]
+        )
         timeout_ms = int(cast(int, arguments.get("timeout_ms", 30_000)))
         include_screenshot = bool(arguments.get("include_screenshot", False))
         done: list[str] = []
@@ -369,7 +373,7 @@ class _PhoneActionTool:
 
 api_version = 3
 name = "phone-use"
-version = "0.4.0"
+version = "0.4.1"
 desc = "连接并后台操作在线的 Android 手机端侧设备（无线调试虚拟屏、悬浮小窗预览、读屏与接管）"
 author = "Akashic"
 inject = (

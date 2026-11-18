@@ -398,6 +398,7 @@ class PhoneBridge:
         device_id: str | None,
         *,
         include_screenshot: bool = False,
+        auto_screenshot: bool = False,
         timeout_ms: int = 20_000,
         before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> PhoneScreenSnapshot:
@@ -405,7 +406,7 @@ class PhoneBridge:
         raw = await self.rpc(
             target_id,
             "observe",
-            {"include_screenshot": include_screenshot},
+            {"include_screenshot": include_screenshot, "auto_screenshot": auto_screenshot},
             timeout_ms=timeout_ms,
             before_send=before_send,
         )
@@ -509,6 +510,9 @@ class PhoneBridge:
             screenshot_png=png_bytes,
             takeover_reason=takeover,
             secure_window=secure_window,
+            truncated=bool(raw.get("truncated", False)),
+            has_webview=bool(raw.get("has_webview", False)),
+            screenshot_reason=reason_text if isinstance(reason_text := raw.get("screenshot_reason"), str) and png_bytes else None,
         )
 
 

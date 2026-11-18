@@ -39,6 +39,7 @@ from .tools import (
     PhoneDevicesTool,
     PhoneObserveInput,
     extract_turn_identity,
+    parse_target,
     snapshot_to_parts,
 )
 
@@ -74,6 +75,19 @@ def _parse_call_identity(arguments: Mapping[str, object], default_device: str) -
 def _same_record(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
     fields = ("v", "control_binding", "session_id", "source", "turn_input_id", "device_id")
     return all(left.get(field) == right.get(field) for field in fields)
+
+
+# 工具参数转端侧线格式：target 解析为 node_id 或 selector，截图默认按需自动附上。
+def wire_payload(arguments: Mapping[str, object]) -> dict[str, object]:
+    payload = {
+        k: v for k, v in arguments.items()
+        if k not in ("_phone", "target", "snapshot_ref") and v is not None
+    }
+    target = arguments.get("target")
+    if isinstance(target, str):
+        payload.update(parse_target(target))
+    payload["auto_screenshot"] = True
+    return payload
 
 
 class PhoneControl:
@@ -136,6 +150,7 @@ class PhoneControl:
         return await self.bridge.observe(
             device_id,
             include_screenshot=bool(arguments.get("include_screenshot", False)),
+            auto_screenshot=True,
             timeout_ms=int(arguments.get("timeout_ms", 20_000)),
             before_send=lambda: self._record_started(key, control_binding, identity),
         )
@@ -149,7 +164,7 @@ class PhoneControl:
         requested_device = cast(str | None, arguments.get("device_id"))
         device_id = self.bridge.resolve_device_id(requested_device)
         identity = _parse_call_identity(arguments, device_id)
-        payload = {k: v for k, v in arguments.items() if k != "_phone" and v is not None}
+        payload = wire_payload(arguments)
         return await self.bridge.perform_action(
             device_id,
             payload,
@@ -329,8 +344,8 @@ async def apply(ctx: Context) -> None:
         ctx,
         name="phone_observe",
         description=(
-            "观察手机端后台虚拟屏幕（VirtualDisplay）当前的 Activity、结构化无障碍 UI 节点树（带 node_id 与中心坐标）"
-            "以及可选的实时截图；可能初始化或唤醒虚拟屏。首次调用前先阅读 phone-use 技能。"
+            "观察手机后台虚拟屏当前界面：紧凑的元素树（一行一个控件，带跨快照不变的 @编号），"
+            "界面读不到控件时自动附截图；可能初始化或唤醒虚拟屏。首次调用前先阅读 phone-use 技能。"
         ),
         parameters=PhoneObserveInput.model_json_schema(),
         open=lambda state: _open_observe(ctx, state),
@@ -344,7 +359,8 @@ async def apply(ctx: Context) -> None:
             "在手机端后台虚拟屏幕（VirtualDisplay）上执行单步操作：启动应用（launch_app）、点击节点或坐标（tap）、"
             "设置输入框全文（type_text，覆盖原有内容，无需先清空；需检查字段内容）、滚动（scroll）、滑动（swipe）、按键（press_key/back）、"
             "打开链接（open_link）、分享文本（share_text）、按用户要求移交手机主屏幕（hand_to_user）"
-            "以及用户完成后收回后台虚拟屏幕（resume_from_user）。每次动作后返回更新后的虚拟屏快照；节点点击和文字输入须原样携带所属快照的 snapshot_ref。"
+            "以及用户完成后收回后台虚拟屏幕（resume_from_user）。用 target 指定元素（@编号或可见文字）；"
+            "动作会等界面稳定后返回最新快照，不需要再插 wait 或 phone_observe。"
         ),
         parameters=PhoneActionInput.model_json_schema(),
         open=lambda state: _open_action(ctx, state),

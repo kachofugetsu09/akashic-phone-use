@@ -27,7 +27,7 @@ PhoneActionKind = Literal[
 
 @dataclass(frozen=True, slots=True)
 class PhoneUiNode:
-    """后台虚拟屏上的单个无障碍/OCR 可交互元素。"""
+    """快照里的一行元素：node_id 即 @编号，同一控件跨快照保持不变；depth 是紧凑树里的缩进层级。"""
 
     node_id: int
     class_name: str
@@ -39,6 +39,14 @@ class PhoneUiNode:
     scrollable: bool = False
     focused: bool = False
     checked: bool | None = None
+    depth: int = 0
+    role: str = ""
+    name: str = ""
+    resource_id: str = ""
+    value: str | None = None
+    hint: str = ""
+    states: tuple[str, ...] = ()
+    scroll: tuple[str, ...] = ()
 
     @property
     def center(self) -> tuple[int, int]:
@@ -64,6 +72,9 @@ class PhoneScreenSnapshot:
     screenshot_png: bytes | None = None
     takeover_reason: str | None = None
     secure_window: bool = False
+    truncated: bool = False
+    has_webview: bool = False
+    screenshot_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

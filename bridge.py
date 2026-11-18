@@ -456,7 +456,7 @@ class PhoneBridge:
         if session is None or session.closed:
             raise PhoneNodeError(f"设备 {target_id!r} 不在线")
         if not session.supports_apps:
-            raise PhoneNodeError(f"设备 {target_id} 的 Akashic Shell {session.shell_version} 不支持读取应用列表，请升级至 0.5.2")
+            raise PhoneNodeError(f"设备 {target_id} 的 Akashic Shell {session.shell_version} 不支持读取应用列表，请升级至 0.5.3")
         if session.apps is not None and not refresh:
             return session.apps
         raw = await self.rpc(target_id, "apps", {}, timeout_ms=timeout_ms)

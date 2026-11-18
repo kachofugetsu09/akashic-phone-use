@@ -1,7 +1,8 @@
 """Phone 工具组定义：按需经 load_tools 解锁，零前缀缓存污染。"""
 from __future__ import annotations
 
-from collections.abc import Mapping
+import difflib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Literal
@@ -23,7 +24,7 @@ from plugins.tools.contract import CallSource, Result
 from plugins.turn_projection.contract import TurnProjection
 
 from .bridge import PhoneBridge, PhoneNodeError
-from .contract import PhoneActionKind, PhoneScreenSnapshot
+from .contract import PhoneActionKind, PhoneApp, PhoneScreenSnapshot
 from .safety import format_screen_snapshot
 
 
@@ -46,23 +47,21 @@ class PhoneObserveInput(BaseModel):
     timeout_ms: int = Field(default=20_000, ge=100, le=110_000)
 
 
-class PhoneActionInput(BaseModel):
+_ACTION_DOC = (
+    "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 target 点击，界面读不到控件时才用 x/y）、"
+    "type_text（设置输入框全文，覆盖原有内容，无需先清空；需检查返回结果与字段内容）、"
+    "clear_text、scroll（up/down/left/right）、swipe、press_key、back、"
+    "open_link、share_text、wait、hand_to_user（按用户要求将应用移交手机主屏幕）、"
+    "resume_from_user（用户完成主屏幕操作后收回后台虚拟屏继续）。"
+)
+
+
+class _StepFields(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    description: str = Field(
-        min_length=1,
-        max_length=60,
-        description="简短中文说明本步操作，例如：在后台虚拟屏打开微信、点击搜索框。",
+    app: str | None = Field(
+        default=None, min_length=1, max_length=100,
+        description="launch_app 的目标：应用显示名（如 \"支付宝\"、\"Clash\"）或包名；不必先查包名。",
     )
-    action: PhoneActionKind = Field(
-        description=(
-            "动作类型：launch_app（在后台虚拟屏启动应用）、tap（按 target 点击，界面读不到控件时才用 x/y）、"
-            "type_text（设置输入框全文，覆盖原有内容，无需先清空；需检查返回结果与字段内容）、"
-            "clear_text、scroll（up/down/left/right）、swipe、press_key、back、"
-            "open_link、share_text、wait、hand_to_user（按用户要求将应用移交手机主屏幕）、"
-            "resume_from_user（用户完成主屏幕操作后收回后台虚拟屏继续）。"
-        )
-    )
-    device_id: str | None = Field(default=None, min_length=1, max_length=128)
     package_name: str | None = Field(default=None, min_length=1, max_length=256)
     target: str | None = Field(
         default=None, min_length=1, max_length=200,
@@ -73,7 +72,6 @@ class PhoneActionInput(BaseModel):
         ),
     )
     node_id: int | None = Field(default=None, ge=1, description="旧写法，等同 target=\"@node_id\"。")
-    snapshot_ref: str | None = Field(default=None, min_length=1, max_length=128, description="已不需要，可省略。")
     x: int | None = Field(default=None, ge=0, le=10_000)
     y: int | None = Field(default=None, ge=0, le=10_000)
     end_x: int | None = Field(default=None, ge=0, le=10_000)
@@ -83,39 +81,114 @@ class PhoneActionInput(BaseModel):
     direction: Literal["up", "down", "left", "right"] | None = None
     key_code: str | None = Field(default=None, min_length=1, max_length=64)
     uri: str | None = Field(default=None, min_length=1, max_length=4096)
+    wait_for: str | None = Field(
+        default=None, min_length=1, max_length=100,
+        description="动作后等待界面出现含这段文字的元素（最多约 8 秒），用于加载慢的页面；出现即返回。",
+    )
+
+
+
+class PhoneStepInput(_StepFields):
+    action: PhoneActionKind = Field(description=_ACTION_DOC)
+
+    @model_validator(mode="after")
+    def _validate_step(self) -> PhoneStepInput:
+        _check_action_fields(self, self.action)
+        return self
+
+
+class PhoneActionInput(_StepFields):
+    description: str = Field(
+        min_length=1,
+        max_length=60,
+        description="简短中文说明本步操作，例如：在后台虚拟屏打开微信、点击搜索框。",
+    )
+    action: PhoneActionKind | None = Field(default=None, description=_ACTION_DOC)
+    steps: list[PhoneStepInput] | None = Field(
+        default=None, min_length=1, max_length=10,
+        description=(
+            "一次顺序执行多步（与 action 二选一），如 打开应用→点搜索→输入。任一步失败即停下，"
+            "返回失败原因与当时的界面；只返回最后一步的快照。下一步依赖本步结果才能决定时不要合并。"
+        ),
+    )
+    device_id: str | None = Field(default=None, min_length=1, max_length=128)
+    snapshot_ref: str | None = Field(default=None, min_length=1, max_length=128, description="已不需要，可省略。")
     reason: str | None = Field(default=None, min_length=1, max_length=500)
     include_screenshot: bool = Field(
         default=False,
-        description="动作执行后是否附带最新一帧后台虚拟屏 PNG 截图。",
+        description="强制附上截图。默认不需要：界面读不到控件文字或动作后界面没变化时会自动附图。",
     )
     timeout_ms: int = Field(default=30_000, ge=100, le=110_000)
 
     @model_validator(mode="after")
-    def _validate_action_fields(self) -> PhoneActionInput:
-        act = self.action
-        if self.target is not None and self.node_id is not None:
-            raise ValueError("target 与 node_id 只能二选一")
-        if self.target is not None:
-            _ = parse_target(self.target)
-        if act == "launch_app" and not self.package_name:
-            raise ValueError("launch_app 必须提供 package_name")
-        if act == "tap" and self.target is None and self.node_id is None and (self.x is None or self.y is None):
-            raise ValueError("tap 必须提供 target，或在界面读不到控件时同时提供 (x, y) 坐标")
-        if act == "type_text" and (self.text is None or self.text == ""):
-            raise ValueError("type_text 必须提供非空 text")
-        if act == "scroll" and self.direction is None:
-            raise ValueError("scroll 必须提供 direction (up/down/left/right)")
-        if act == "swipe" and any(v is None for v in (self.x, self.y, self.end_x, self.end_y)):
-            raise ValueError("swipe 必须提供起点 (x, y) 与终点 (end_x, end_y)")
-        if act == "press_key" and not self.key_code:
-            raise ValueError("press_key 必须提供 key_code")
-        if act == "open_link" and not self.uri:
-            raise ValueError("open_link 必须提供 uri")
-        if act == "share_text" and (not self.package_name or not self.text):
-            raise ValueError("share_text 必须同时提供 package_name 与 text")
-        if act == "hand_to_user" and not self.reason:
+    def _validate_request(self) -> PhoneActionInput:
+        if (self.action is None) == (self.steps is None):
+            raise ValueError("action 与 steps 必须且只能提供一个")
+        stray = sorted(self.model_fields_set & set(_StepFields.model_fields)) if self.steps is not None else []
+        if stray:
+            raise ValueError(f"使用 steps 时 {', '.join(stray)} 要写进各步里，不能放在顶层")
+        if self.action is not None:
+            _check_action_fields(self, self.action)
+        if self.action == "hand_to_user" and not self.reason:
             raise ValueError("hand_to_user 必须提供 reason 说明移交原因")
+        for index, step in enumerate(self.steps or (), start=1):
+            if step.action in ("hand_to_user", "resume_from_user"):
+                raise ValueError(f"第 {index} 步：{step.action} 需单独调用，不能放进 steps")
         return self
+
+
+def _check_action_fields(step: _StepFields, act: PhoneActionKind) -> None:
+    if step.target is not None and step.node_id is not None:
+        raise ValueError("target 与 node_id 只能二选一")
+    if step.app is not None and step.package_name is not None:
+        raise ValueError("app 与 package_name 只能二选一")
+    if step.target is not None:
+        _ = parse_target(step.target)
+    if act == "launch_app" and not (step.app or step.package_name):
+        raise ValueError("launch_app 必须提供 app（应用名或包名）")
+    if act == "tap" and step.target is None and step.node_id is None and (step.x is None or step.y is None):
+        raise ValueError("tap 必须提供 target，或在界面读不到控件时同时提供 (x, y) 坐标")
+    if act == "type_text" and (step.text is None or step.text == ""):
+        raise ValueError("type_text 必须提供非空 text")
+    if act == "scroll" and step.direction is None:
+        raise ValueError("scroll 必须提供 direction (up/down/left/right)")
+    if act == "swipe" and any(v is None for v in (step.x, step.y, step.end_x, step.end_y)):
+        raise ValueError("swipe 必须提供起点 (x, y) 与终点 (end_x, end_y)")
+    if act == "press_key" and not step.key_code:
+        raise ValueError("press_key 必须提供 key_code")
+    if act == "open_link" and not step.uri:
+        raise ValueError("open_link 必须提供 uri")
+    if act == "share_text" and (not (step.package_name or step.app) or not step.text):
+        raise ValueError("share_text 必须同时提供目标应用（app 或 package_name）与 text")
+
+
+def resolve_app(apps: Sequence[PhoneApp], query: str) -> str:
+    """按显示名或包名找唯一应用：精确 > 前缀 > 包含；找不到或不唯一时给出候选。"""
+    wanted = query.strip().casefold()
+    by_package = [app for app in apps if app.package.casefold() == wanted]
+    if by_package:
+        return by_package[0].package
+    for rule in (
+        lambda label: label == wanted,
+        lambda label: label.startswith(wanted),
+        lambda label: wanted in label,
+    ):
+        hits = [app for app in apps if rule(app.label.casefold())]
+        if len(hits) == 1:
+            return hits[0].package
+        if len(hits) > 1:
+            listed = "；".join(f"{app.label}（{app.package}）" for app in hits[:8])
+            raise ValueError(f"\"{query}\" 匹配到多个应用：{listed}，请写全名或包名")
+    if "." in wanted and " " not in wanted:
+        return query.strip()
+    close = difflib.get_close_matches(wanted, [app.label.casefold() for app in apps], n=5, cutoff=0.4)
+    names = [app.label for app in apps if app.label.casefold() in close]
+    hint = f"；相近的有：{'、'.join(names)}" if names else "；可用 phone_devices 查看已装应用"
+    raise ValueError(f"手机上没有名为 \"{query}\" 的应用{hint}")
+
+
+def format_apps(apps: Sequence[PhoneApp]) -> str:
+    return "、".join(app.label for app in sorted(apps, key=lambda app: app.label.casefold()))
 
 
 def parse_target(target: str) -> dict[str, object]:
@@ -235,6 +308,7 @@ class PhoneDevicesTool:
                 ),
             )
         lines = [f"Online Android Devices ({len(devices)}):"]
+        app_lines: list[str] = []
         for dev in devices:
             vd = f"#{dev.virtual_display_id}" if dev.virtual_display_id is not None else "lazy (not created yet)"
             focus_info = (
@@ -251,7 +325,16 @@ class PhoneDevicesTool:
             if dev.takeover_reason:
                 line += f" | TAKEOVER_PENDING={dev.takeover_reason!r}"
             lines.append(line)
-        return Result("success", (ContentPart("text", "\n".join(lines)),))
+            if self._bridge.supports_apps(dev.device_id):
+                try:
+                    apps = await self._bridge.launcher_apps(dev.device_id, refresh=True)
+                except PhoneNodeError as error:
+                    app_lines.append(f"{dev.device_id} 已装应用：暂时读不到（{error}）")
+                else:
+                    app_lines.append(
+                        f"{dev.device_id} 已装应用（{len(apps)} 个，launch_app 直接写 app=显示名）：{format_apps(apps)}"
+                    )
+        return Result("success", (ContentPart("text", "\n".join([*lines, *app_lines])),))
 
     async def query(self, key: str) -> Result | None:
         _ = key

@@ -10,6 +10,7 @@ from typing import Literal, cast
 from uuid import uuid4
 
 from .contract import (
+    PhoneApp,
     PhoneDeviceDescriptor,
     PhoneDisplayMode,
     PhonePipState,
@@ -29,7 +30,7 @@ class PhoneNodeError(RuntimeError):
 
     def __init__(self, message: str, *, outcome: Literal["not_sent", "unknown"] = "not_sent") -> None:
         super().__init__(message)
-        self.outcome = outcome
+        self.outcome: Literal["not_sent", "unknown"] = outcome
 
 
 @dataclass
@@ -50,6 +51,9 @@ class _NodeSession:
     send_json: Callable[[dict[str, object]], Awaitable[None]]
     close_transport: Callable[[], Awaitable[None]]
     supports_ack: bool = False
+    supports_tree_v2: bool = False
+    supports_apps: bool = False
+    apps: tuple[PhoneApp, ...] | None = None
     connected_at: float = 0.0
     pending: dict[str, asyncio.Future[dict[str, object]]] = field(default_factory=dict)
     acks: dict[str, asyncio.Event] = field(default_factory=dict)
@@ -168,6 +172,8 @@ class PhoneBridge:
             send_json=send_json,
             close_transport=close_transport,
             supports_ack=hello.get("supports_ack") is True,
+            supports_tree_v2=hello.get("supports_tree_v2") is True,
+            supports_apps=hello.get("supports_apps") is True,
             connected_at=asyncio.get_running_loop().time(),
         )
         self._sessions[device_id] = session
@@ -440,6 +446,36 @@ class PhoneBridge:
             else None
         )
         return summary, snapshot
+
+    async def launcher_apps(
+        self, device_id: str | None, *, refresh: bool = False, timeout_ms: int = 10_000,
+    ) -> tuple[PhoneApp, ...]:
+        """桌面应用列表按连接缓存；Shell 重连（含装卸应用后重启）时自然刷新。"""
+        target_id = self.resolve_device_id(device_id)
+        session = self._sessions.get(target_id)
+        if session is None or session.closed:
+            raise PhoneNodeError(f"设备 {target_id!r} 不在线")
+        if not session.supports_apps:
+            raise PhoneNodeError(f"设备 {target_id} 的 Akashic Shell {session.shell_version} 不支持读取应用列表，请升级至 0.5.2")
+        if session.apps is not None and not refresh:
+            return session.apps
+        raw = await self.rpc(target_id, "apps", {}, timeout_ms=timeout_ms)
+        items = raw.get("apps")
+        apps = tuple(
+            PhoneApp(label=str(item.get("label") or item["package"]), package=str(item["package"]))
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, Mapping) and isinstance(item.get("package"), str) and item["package"]
+        )
+        session.apps = apps
+        return apps
+
+    def supports_tree_v2(self, device_id: str | None) -> bool:
+        session = self._sessions.get(self.resolve_device_id(device_id))
+        return session is not None and session.supports_tree_v2
+
+    def supports_apps(self, device_id: str | None) -> bool:
+        session = self._sessions.get(self.resolve_device_id(device_id))
+        return session is not None and session.supports_apps
 
     async def finish_display(
         self,

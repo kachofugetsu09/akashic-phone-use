@@ -26,6 +26,14 @@ PhoneActionKind = Literal[
 
 
 @dataclass(frozen=True, slots=True)
+class PhoneApp:
+    """手机桌面上可启动的应用：显示名随手机语言。"""
+
+    label: str
+    package: str
+
+
+@dataclass(frozen=True, slots=True)
 class PhoneUiNode:
     """快照里的一行元素：node_id 即 @编号，同一控件跨快照保持不变；depth 是紧凑树里的缩进层级。"""
 

@@ -16,32 +16,52 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 1. **按需加载工具组**：
    调用 `load_tools`，传入插件工具目录中 `phone-use` 的准确 ID（如 `{"plugin": "phone-use@local"}`、`{"plugin": "phone-use@github"}` 或 `{"plugin": "phone-use"}`），获取 `phone_devices`、`phone_observe`、`phone_action` 三个工具的完整 schema。
 2. **拉取在线手机列表（`phone_devices`）**：
-   调用 `tool_call(name="phone_devices", arguments={})` 查看当前连入的手机：
-   - 确认 `device_id`（例如 `"pixel-9"`）、`display_mode`（`"virtual_display"` 表示后台独立焦点虚拟屏已就绪）、`own_focus=true` 与 `steal_top_focus_disabled=true`；
+   调用 `tool_call(name="phone_devices", arguments={})` 查看当前连入的手机与**已装应用清单**：
    - 如果 `0 devices online`，直接如实告诉用户手机端 `Akashic Shell` 当前未连接或未开启后台控制，不要盲目重试。
-   - 如果只有 1 台手机在线，后续 `phone_observe` / `phone_action` 可以省略 `device_id`；若有多台手机同时在线，必须显式传入目标 `device_id`。
-3. **启动或观察目标应用（`phone_action` / `phone_observe`）**：
-   - 后台虚拟屏采用懒创建（`LazyDisplay`）：首次调用 `phone_action(action="launch_app", package_name="...")` 或 `phone_observe` 时自动建屏，纯聊天回合从头到尾不建屏。
-   - 每次 `phone_action` 执行完毕都会自动返回动作后的最新虚拟屏 UI 节点树快照（含 `snapshot_ref` 及每个可交互控件的 `[node_id]`、文本、类名、`bounds` 与 `center` 坐标），无需在每次点击后再单独调一次 `phone_observe`。
+   - 只有 1 台手机在线时，后续调用可以省略 `device_id`；多台同时在线必须显式传入。
+   - 清单里的显示名就是 `launch_app` 的 `app` 参数，不需要知道包名。用户说的应用不在清单里，就如实说没装，不要猜包名。
+3. **启动或观察目标应用**：
+   - 后台虚拟屏懒创建：首次 `launch_app` 或 `phone_observe` 时自动建屏，纯聊天回合不建屏。
+   - 每次 `phone_action` 都会等界面稳定后自动返回最新快照，**不需要**在动作后再调 `phone_observe`，也不需要插 `wait`。
 
 ## 2. 核心设计机制与操作准则
 
 ### 后台虚拟屏与主屏隔离
 - **焦点隔离**：端侧请求 `FLAG_TRUSTED | FLAG_OWN_DISPLAY_GROUP | FLAG_ALWAYS_UNLOCKED | FLAG_OWN_FOCUS | FLAG_STEAL_TOP_FOCUS_DISABLED` 与 `DISPLAY_IME_POLICY_LOCAL`；这些配置不替代对当前设备焦点行为的验证。
-- **主屏占用避让（`START_IN_USE_ON_MAIN`）**：如果用户此时正在主屏幕前台使用某个 App（非 `Akashic Shell`），端侧拒绝把该 App 强行抽到后台虚拟屏。收到占用提示时，礼貌询问用户或等用户切回聊天界面后再操作。
+- **借用主屏后台任务**：目标应用已在主屏最近任务里但没显示时，Shell 会把该任务借到后台屏继续用（返回"已把主屏后台的 … 借到后台显示器"），收尾时归还主屏并恢复用户原来的前台，不需要移交用户。
+- **主屏正在用（`PHONE_APP_IN_USE`）**：目标应用正显示在主屏（用户可能在用）时不抢。告诉用户稍后再试，或用户同意后 `hand_to_user`；不要反复重试同一次启动。
 - **音频状态**：后台虚拟屏不等于独立音频环境。当前 Shell 没有自动静音实现；旧端侧还可能固定报告 `audio_muted=true`，不能据此断言用户听不到声音或音频焦点未受影响。
 - **输入结果**：`type_text` 设置输入框全文，会覆盖原有内容；替换文本时无需先调用 `clear_text`。追加内容需先读出现有全文再组成目标文本；只需清空时使用 `clear_text`。操作后检查返回的字段内容；自定义编辑器可能不支持输入。当前 Shell 没有保存并恢复原剪贴板的实现，不承诺静默粘贴或原剪贴板不变。输入失败或结果不明时，先观察，不直接重复输入，也不自行切换到主屏。
 
-### 优先使用结构化 UI 树，按需索取截图
-- 默认返回的 `UI Elements` 列表已包含所有可见可交互控件的 `[node_id]`：
-  - 点击已知控件优先传 `node_id`：`phone_action(description="点击搜索按钮", action="tap", node_id=3, snapshot_ref="req-...工具返回的完整引用...")`；
-  - 只有在自定义绘制界面（游戏、Canvas、无标签图标）导致节点树缺失时，才将 `include_screenshot=true` 传给 `phone_observe` 或 `phone_action`，结合视觉截图用 `x, y` 坐标点击。
+### 读快照，不读图（最便宜的足够观察）
+快照是紧凑的元素树，一行一个控件，按层级缩进，例如：
 
-### 快照引用（Shell 0.5.0 / phone-use 0.3.0 起）
-- 节点点击以及 `type_text` / `clear_text` 必须把目标快照的 `snapshot_ref` 原样传回；文字操作省略 `node_id` 时也必填。
-- 每次观察或动作返回新快照后，使用新引用；短 `node_id` 只在所属快照内有效，不能与另一快照的引用混用。
-- 缺少引用不会自动使用最新快照。收到 `PHONE_SNAPSHOT_STALE` 时先重新观察，不能用旧编号直接重试。
-- 坐标点击不使用节点引用；快照引用不保证页面不会异步变化，仍需检查动作结果。
+```
+pixel-9 后台屏 #3 · com.eg.android.AlipayGphone · MainActivity
+界面元素（target 可写 "@编号"、可见文字或 "id=资源名"；@编号跨快照有效）：
+- textbox "搜索" @4 [id=search_input]
+- list @7 [下方还有]
+  - item "转账 · 免费转账到支付宝或银行卡" @9
+  - item "余额宝 · 昨日收益 0.52" @10
+- tab "我的" @15 [当前选中]
+```
+
+- 可点击控件已把它里面的文字并入名称（如 `"转账 · 免费转账…"`），直接点这一行即可，不要去找里面的文字节点。
+- **定位用 `target`**：`"@9"`、可见文字 `"转账"`（子串、忽略大小写）、两端加引号做精确匹配、或 `"id=search_input"`。同一控件的 `@编号` 在后续快照里保持不变，可以直接沿用；控件消失时会报 `PHONE_NODE_STALE`，按最新快照重选。文字匹配到多个会列出候选，改用 `@编号`。
+- `[下方还有]` 表示该列表还能往下滚：`phone_action(action="scroll", target="@7", direction="down")` 只滚这个列表（滚轮选择器、横向标签也这样滚），不写 target 则整屏滑动。
+- **截图默认不附**。界面读不到控件文字（自绘、游戏、地图、部分网页或屏蔽无障碍的应用）或动作后界面没有变化时，会自动附上截图并写明原因。只有确实要看颜色、图片、图表等视觉信息时才传 `include_screenshot=true`；只在有截图时才用 `x, y` 坐标点击。
+
+### 合并多步（`steps`）与等待（`wait_for`）
+- 下一步不依赖上一步结果时，合并成一次调用，像人一样连续操作：
+  ```json
+  {"description": "打开支付宝搜索转账", "steps": [
+    {"action": "launch_app", "app": "支付宝"},
+    {"action": "tap", "target": "搜索"},
+    {"action": "type_text", "target": "搜索", "text": "转账"}
+  ]}
+  ```
+  任一步失败就停下，返回失败原因和当时的界面；只返回最后一步的快照。要先看结果才能决定的步骤不要合并。
+- 页面加载慢时给那一步加 `wait_for`（一段会出现的文字），出现即返回，最多等约 8 秒；不要用 `wait` 盲等。
 
 ### 断连与结果丢失
 - 明确报告“排队超时，未发送到端侧”表示本次请求没有执行；先处理占用设备的在途操作，再决定是否重新发起。
@@ -67,17 +87,3 @@ description: 连接并在后台虚拟屏幕（VirtualDisplay）中操作用户�
 ### Turn 结束自动收尾
 - 当前对话 Turn 闭合（`complete` / `quiet` / `abandoned`）时，插件的后台 follower 会向手机端发送 `finish` 请求释放虚拟屏幕。
 - 自动收尾只释放整个后台虚拟屏。工具不支持 `keep_packages` / `close_packages`，传入会明确报参数错误。收尾不保证应用已保留、关闭、停止发声或从最近任务消失，也不包含恢复静音或原剪贴板。
-
-## 3. 常见包名速查
-
-| 应用 | 包名 (`package_name`) |
-|---|---|
-| 微信 | `com.tencent.mm` |
-| 小红书 | `com.xingin.xhs` |
-| 美团 | `com.sankuai.meituan` |
-| 淘宝 | `com.taobao.taobao` |
-| 哔哩哔哩 | `tv.danmaku.bili` |
-| Telegram | `org.telegram.messenger` |
-| 系统设置 | `com.android.settings` |
-| 系统时钟/闹钟 | `com.google.android.deskclock` |
-| Chrome 浏览器 | `com.android.chrome` |

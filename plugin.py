@@ -439,7 +439,7 @@ async def apply(ctx: Context) -> None:
         yield devices_tool
 
     catalog = ctx.require(TOOLS)
-    _ = await catalog.declare_group(ctx, always_on=False, description=desc)
+    _ = await catalog.declare_group(ctx, always_on=False, description=desc, icon="smartphone")
     await catalog.register(
         ctx,
         name="phone_devices",
@@ -464,6 +464,7 @@ async def apply(ctx: Context) -> None:
         open=lambda state: _open_observe(ctx, state),
         capture=lambda options: _capture(ctx, options),
         idempotent=False,
+        icon="eye",
     )
     await catalog.register(
         ctx,

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import difflib
+import json
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,6 +27,13 @@ from plugins.turn_projection.contract import TurnProjection
 
 from .bridge import PhoneBridge, PhoneNodeError
 from .contract import PhoneActionKind, PhoneApp, PhoneScreenSnapshot
+from .events import (
+    AdapterKind,
+    PhoneEventStore,
+    PhoneSubscriptionRule,
+    RuleActionsConfig,
+    RuleMatchConfig,
+)
 from .safety import format_screen_snapshot
 
 
@@ -335,6 +344,146 @@ class PhoneDevicesTool:
                         f"{dev.device_id} 已装应用（{len(apps)} 个，launch_app 直接写 app=显示名）：{format_apps(apps)}"
                     )
         return Result("success", (ContentPart("text", "\n".join([*lines, *app_lines])),))
+
+    async def query(self, key: str) -> Result | None:
+        _ = key
+        return None
+
+
+class PhoneEventsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=False)
+    action: Literal["recent_events", "app_sessions", "current_state"] = Field(
+        default="recent_events",
+        description="recent_events（查询最近事件）、app_sessions（前台应用会话时长）、current_state（最近一次前台/媒体/设备状态）",
+    )
+    adapter: AdapterKind | None = Field(default=None, description="按适配器过滤：notification / foreground / appops / media / device")
+    package_name: str | None = Field(default=None, min_length=1, max_length=256)
+    device_id: str | None = Field(default=None, min_length=1, max_length=128)
+    since_hours: float = Field(default=24.0, gt=0, le=720.0)
+    limit: int = Field(default=30, ge=1, le=100)
+
+
+class DeviceSubscribeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=False)
+    action: Literal["list", "upsert", "remove", "enable", "disable"] = Field(
+        description="list（查看规则）、upsert（新增或覆盖规则并立即下发手机）、remove（删除规则）、enable/disable（启停规则）"
+    )
+    rule_id: str | None = Field(default=None, min_length=1, max_length=100, description="remove / enable / disable 时必填；upsert 时可写在 rule.id")
+    rule: PhoneSubscriptionRule | None = Field(default=None, description="upsert 时的完整订阅规则对象")
+    ttl_seconds: int | None = Field(default=None, ge=60, le=30 * 86_400, description="可选：给 upsert 规则设置有效期（秒），到期自动失效")
+
+    @model_validator(mode="after")
+    def _validate_subscribe(self) -> DeviceSubscribeInput:
+        if self.action == "upsert" and self.rule is None:
+            raise ValueError("upsert 必须提供 rule 对象")
+        if self.action in ("remove", "enable", "disable") and not self.rule_id:
+            raise ValueError(f"{self.action} 必须提供 rule_id")
+        return self
+
+
+class PhoneEventsTool:
+    """按需只读查询手机端侧采集到的事件流与最新状态。"""
+
+    idempotent = True
+
+    def __init__(self, store: PhoneEventStore) -> None:
+        self._store = store
+
+    async def prepare(
+        self, arguments: Mapping[str, object], source: CallSource | None = None
+    ) -> Mapping[str, object] | str:
+        _ = source
+        try:
+            return PhoneEventsInput.model_validate(json_value(arguments)).model_dump(mode="json")
+        except ValidationError as error:
+            return str(error)
+
+    async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
+        _ = key
+        action = str(arguments.get("action") or "recent_events")
+        if action == "recent_events":
+            data = await run_file_io(
+                lambda: self._store.query_recent_events(
+                    adapter=arguments.get("adapter") if isinstance(arguments.get("adapter"), str) else None,
+                    package_name=arguments.get("package_name") if isinstance(arguments.get("package_name"), str) else None,
+                    device_id=arguments.get("device_id") if isinstance(arguments.get("device_id"), str) else None,
+                    since_hours=float(arguments.get("since_hours") or 24.0),
+                    limit=int(arguments.get("limit") or 30),
+                )
+            )
+        elif action == "app_sessions":
+            data = await run_file_io(
+                lambda: self._store.query_app_sessions(
+                    package_name=arguments.get("package_name") if isinstance(arguments.get("package_name"), str) else None,
+                    device_id=arguments.get("device_id") if isinstance(arguments.get("device_id"), str) else None,
+                    since_hours=float(arguments.get("since_hours") or 24.0),
+                    limit=int(arguments.get("limit") or 30),
+                )
+            )
+        else:
+            data = await run_file_io(
+                lambda: self._store.query_current_state(
+                    device_id=arguments.get("device_id") if isinstance(arguments.get("device_id"), str) else None,
+                )
+            )
+        return Result("success", (ContentPart("text", json.dumps(data, ensure_ascii=False, indent=2)),))
+
+    async def query(self, key: str) -> Result | None:
+        _ = key
+        return None
+
+
+class DeviceSubscribeTool:
+    """动态管理手机端侧事件订阅规则，变更后立即持久化并推送到在线手机。"""
+
+    idempotent = False
+
+    def __init__(self, store: PhoneEventStore, bridge: PhoneBridge) -> None:
+        self._store = store
+        self._bridge = bridge
+
+    async def prepare(
+        self, arguments: Mapping[str, object], source: CallSource | None = None
+    ) -> Mapping[str, object] | str:
+        _ = source
+        try:
+            return DeviceSubscribeInput.model_validate(json_value(arguments)).model_dump(mode="json")
+        except ValidationError as error:
+            return str(error)
+
+    async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
+        _ = key
+        action = str(arguments["action"])
+        if action == "list":
+            payload = await run_file_io(self._store.list_rules)
+            return Result("success", (ContentPart("text", json.dumps(payload, ensure_ascii=False, indent=2)),))
+
+        if action == "upsert":
+            rule = PhoneSubscriptionRule.model_validate(arguments["rule"])
+            ttl = arguments.get("ttl_seconds")
+            if isinstance(ttl, (int, float)) and not isinstance(ttl, bool):
+                rule = rule.model_copy(update={"expires_at": time.time() + float(ttl)})
+            payload = await run_file_io(lambda: self._store.upsert_rule(rule))
+        elif action == "remove":
+            rule_id = str(arguments["rule_id"])
+            found, payload = await run_file_io(lambda: self._store.remove_rule(rule_id))
+            if not found:
+                return Result("error", (ContentPart("text", f"未找到订阅规则 {rule_id!r}"),))
+        else:
+            rule_id = str(arguments["rule_id"])
+            enabled = action == "enable"
+            found, payload = await run_file_io(lambda: self._store.set_rule_enabled(rule_id, enabled))
+            if not found:
+                return Result("error", (ContentPart("text", f"未找到订阅规则 {rule_id!r}"),))
+
+        pushed = await self._bridge.push_rules(payload)
+        summary = {
+            "ok": True,
+            "pushed_devices": pushed,
+            "rules_version": payload["rules_version"],
+            "rules": payload["rules"],
+        }
+        return Result("success", (ContentPart("text", json.dumps(summary, ensure_ascii=False, indent=2)),))
 
     async def query(self, key: str) -> Result | None:
         _ = key

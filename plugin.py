@@ -32,17 +32,33 @@ from plugins.turn_projection.contract import TURN_PROJECTION, TurnProjection
 
 from .bridge import PhoneBridge, PhoneNodeError
 from .contract import PHONE_BRIDGE, PhoneScreenSnapshot
+from .events import PhoneEventStore, PhoneInformationProvider, StoredPhoneEvent
 from .server import start_phone_listener
 from .tools import (
+    DeviceSubscribeInput,
+    DeviceSubscribeTool,
     PhoneActionInput,
     PhoneDevicesInput,
     PhoneDevicesTool,
+    PhoneEventsInput,
+    PhoneEventsTool,
     PhoneObserveInput,
     extract_turn_identity,
     parse_target,
     resolve_app,
     snapshot_to_parts,
 )
+
+try:
+    from plugins.watch.contract import WATCH_EVENTS, WatchEvents
+except ImportError:
+    WATCH_EVENTS = None  # type: ignore[assignment]
+    WatchEvents = None  # type: ignore[assignment,misc]
+
+try:
+    from plugins.userinformation.contract import USER_INFORMATION
+except ImportError:
+    USER_INFORMATION = None  # type: ignore[assignment]
 
 PHONE_CONTROL = ServiceKey["PhoneControl"]("phone.control.v1")
 
@@ -373,8 +389,8 @@ class _PhoneActionTool:
 
 api_version = 3
 name = "phone-use"
-version = "0.4.3"
-desc = "连接并后台操作在线的 Android 手机端侧设备（无线调试虚拟屏、悬浮小窗预览、读屏与接管）"
+version = "0.5.0"
+desc = "连接并后台操作在线的 Android 手机端侧设备（无线调试虚拟屏、多适配器低功耗事件订阅与查询）"
 author = "Akashic"
 inject = (
     INSTALLED_ASSETS,
@@ -415,8 +431,36 @@ async def _open_action(ctx: Context, state: Mapping[str, object]) -> AsyncIterat
 
 
 async def apply(ctx: Context) -> None:
-    """注册按需加载的 Phone 工具组、无线调试 Bridge 监听器与 Turn 收尾跟随器。"""
+    """注册按需加载的 Phone 工具组、无线调试 Bridge 监听器、事件订阅存储与 Turn 收尾跟随器。"""
+    from datetime import datetime
     await ctx.require(INSTALLED_ASSETS).register(ctx, "skills", "skills")
+    event_store = await run_file_io(lambda: PhoneEventStore(ctx.data_root))
+    watch_port: list[tuple[Context, WatchEvents]] = []
+
+    async def on_events_ingested(accepted: list[StoredPhoneEvent]) -> None:
+        if not watch_port:
+            return
+        w_ctx, watch = watch_port[0]
+        for ev in accepted:
+            rule = await run_file_io(lambda rid=ev.rule_id: event_store.find_rule(rid)) if ev.rule_id else None
+            if rule is not None:
+                if not rule.actions.emit_watch:
+                    continue
+                source = rule.actions.watch_source or f"phone.{ev.adapter}"
+                is_state = rule.actions.watch_state
+            else:
+                source = f"phone.{ev.adapter}"
+                is_state = ev.adapter in ("media", "device")
+            title = ev.title or f"{ev.adapter}: {ev.package_name or ev.event_type}"
+            text = ev.summary or ev.package_name or ev.event_type
+            at = datetime.fromtimestamp(ev.ts_ms / 1000.0, event_store.tz)
+            key = f"phone:{ev.device_id}:{ev.event_id}"
+            try:
+                async with w_ctx.runtime_scope():
+                    _ = await watch.emit(source, title=title, text=text, at=at, state=is_state, key=key)
+            except Exception as error:
+                ctx.report_incident("phone-watch-emit", f"{source}/{key}: {error}")
+
     wake_reconcile = asyncio.Event()
     pending_reconcile: dict[str, str] = {}
 
@@ -430,13 +474,28 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.provide(PHONE_BRIDGE, bridge)
     _ = await ctx.provide(PHONE_CONTROL, control)
 
-    await start_phone_listener(ctx, bridge)
+    await start_phone_listener(
+        ctx,
+        bridge,
+        event_store=event_store,
+        on_events_ingested=on_events_ingested,
+    )
 
     devices_tool = PhoneDevicesTool(bridge)
+    events_tool = PhoneEventsTool(event_store)
+    subscribe_tool = DeviceSubscribeTool(event_store, bridge)
 
     @asynccontextmanager
     async def _open_devices(_state: Mapping[str, object]) -> AsyncIterator[PhoneDevicesTool]:
         yield devices_tool
+
+    @asynccontextmanager
+    async def _open_events(_state: Mapping[str, object]) -> AsyncIterator[PhoneEventsTool]:
+        yield events_tool
+
+    @asynccontextmanager
+    async def _open_subscribe(_state: Mapping[str, object]) -> AsyncIterator[DeviceSubscribeTool]:
+        yield subscribe_tool
 
     catalog = ctx.require(TOOLS)
     _ = await catalog.declare_group(ctx, always_on=False, description=desc, icon="smartphone")
@@ -452,6 +511,31 @@ async def apply(ctx: Context) -> None:
         open=_open_devices,
         idempotent=True,
         parallel=True,
+    )
+    await catalog.register(
+        ctx,
+        name="phone_events",
+        description=(
+            "按需只读查询手机端侧收集到的事件流（通知、前台应用会话与时长、AppOps 定位/相机/麦克风使用、"
+            "媒体播放状态、Wi-Fi/亮屏/充电设备上下文）以及最近一次已知状态。"
+        ),
+        parameters=PhoneEventsInput.model_json_schema(),
+        open=_open_events,
+        idempotent=True,
+        parallel=True,
+        icon="activity",
+    )
+    await catalog.register(
+        ctx,
+        name="device_subscribe",
+        description=(
+            "动态查看、新增、修改、启停或删除手机端侧声明式事件订阅规则（支持 notification / foreground / "
+            "appops / media / device 五类适配器，变更后立即持久化并实时推送到在线手机）。"
+        ),
+        parameters=DeviceSubscribeInput.model_json_schema(),
+        open=_open_subscribe,
+        idempotent=False,
+        icon="bell-ring",
     )
     await catalog.register(
         ctx,
@@ -489,6 +573,26 @@ async def apply(ctx: Context) -> None:
         )
 
     _ = await ctx.on(RUNTIME_STARTED, start_follower)
+
+    if WATCH_EVENTS is not None:
+        async def attach_watch(child: Context) -> None:
+            entry = (child, child.require(WATCH_EVENTS))
+            watch_port.append(entry)
+
+            def detach() -> None:
+                if entry in watch_port:
+                    watch_port.remove(entry)
+
+            _ = await child.effect(lambda: detach, label="phone-watch-port")
+
+        _ = await ctx.inject((WATCH_EVENTS,), attach_watch, name="phone-watch-events")
+
+    if USER_INFORMATION is not None:
+        _ = await ctx.inject(
+            (USER_INFORMATION,),
+            lambda child: child.require(USER_INFORMATION).register(child, PhoneInformationProvider(event_store)),
+            name="phone-user-information",
+        )
 
 
 def _turn_closed(

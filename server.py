@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from contextlib import contextmanager, suppress
 import json
 import logging
@@ -17,15 +17,17 @@ from starlette.types import Receive, Scope, Send
 import uvicorn
 
 from agent.plugin_composition import Context
+from core.common.file_io import run_file_io
 from core.common.unix_socket import prepare_unix_socket, socket_alias_path
 
 from .bridge import PhoneBridge, PhoneNodeError, _NodeSession
+from .events import PhoneEventStore, StoredPhoneEvent
 
 logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = 10.0
 MIN_SHELL_VERSION = "0.5.0"
 # /api/phone/apk 下发的版本；可高于协议下限。
-BUNDLED_SHELL_VERSION = "0.5.4"
+BUNDLED_SHELL_VERSION = "0.6.0"
 
 
 class PhoneListenerServer(uvicorn.Server):
@@ -93,9 +95,23 @@ def _sse_event(name: str, payload: dict[str, object]) -> bytes:
     return f"event: {name}\ndata: {data}\n\n".encode("utf-8")
 
 
-def create_phone_app(bridge: PhoneBridge) -> FastAPI:
+def create_phone_app(
+    bridge: PhoneBridge,
+    *,
+    event_store: PhoneEventStore | None = None,
+    on_events_ingested: Callable[[list[StoredPhoneEvent]], Awaitable[None]] | None = None,
+) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     plugin_dir = Path(__file__).resolve().parent
+
+    def welcome_payload(session: _NodeSession) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "device_id": session.device_id,
+            "connection_id": session.connection_id,
+        }
+        if event_store is not None and session.supports_events:
+            payload.update(event_store.get_rules_payload())
+        return payload
 
     @app.get("/api/phone/apk")
     async def download_apk() -> FileResponse:
@@ -160,7 +176,7 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
         async def events() -> AsyncGenerator[bytes, None]:
-            yield _sse_event("welcome", {"device_id": session.device_id, "connection_id": session.connection_id})
+            yield _sse_event("welcome", welcome_payload(session))
             while not session.closed:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
@@ -199,6 +215,43 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"设备 {device_id!r} 未注册或连接已断开")
         return JSONResponse({"ok": True})
 
+    @app.get("/api/phone/rules")
+    async def get_rules() -> JSONResponse:
+        if event_store is None:
+            return JSONResponse({"rules_version": 0, "rules": []})
+        return JSONResponse(await run_file_io(event_store.get_rules_payload))
+
+    @app.post("/api/phone/events")
+    async def ingest_phone_events(request: Request) -> JSONResponse:
+        """接收 Android 端侧订阅引擎批量/实时上报的原始设备事件。"""
+        if event_store is None:
+            raise HTTPException(status_code=503, detail="事件存储未初始化")
+        try:
+            body = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="无效的 JSON 事件载荷") from error
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="事件载荷必须是 JSON 对象")
+        device_id = str(body.get("device_id") or "").strip()
+        if not device_id or len(device_id) > 128:
+            raise HTTPException(status_code=400, detail="缺少合法的 device_id")
+        raw_events = body.get("events")
+        if not isinstance(raw_events, list):
+            raise HTTPException(status_code=400, detail="events 必须是数组")
+        if len(raw_events) > 200:
+            raise HTTPException(status_code=400, detail="单次上报事件数不能超过 200")
+        normalized = [item for item in raw_events if isinstance(item, dict)]
+        accepted = await run_file_io(lambda: event_store.ingest_events(device_id, normalized))
+        if accepted and on_events_ingested is not None:
+            await on_events_ingested(accepted)
+        rules_info = await run_file_io(event_store.get_rules_payload)
+        return JSONResponse({
+            "ok": True,
+            "accepted": len(accepted),
+            "rules_version": rules_info["rules_version"],
+            "rules": rules_info["rules"],
+        })
+
     @app.websocket("/api/phone/ws")
     async def node_ws(websocket: WebSocket) -> None:
         await websocket.accept()
@@ -235,7 +288,7 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
                 send_json=send_json,
                 close_transport=close_transport,
             )
-            await send_json({"type": "welcome", "device_id": session.device_id, "connection_id": session.connection_id})
+            await send_json({"type": "welcome", **welcome_payload(session)})
             while True:
                 raw = await websocket.receive_text()
                 frame = json.loads(raw)
@@ -253,10 +306,16 @@ def create_phone_app(bridge: PhoneBridge) -> FastAPI:
     return app
 
 
-async def start_phone_listener(ctx: Context, bridge: PhoneBridge) -> None:
+async def start_phone_listener(
+    ctx: Context,
+    bridge: PhoneBridge,
+    *,
+    event_store: PhoneEventStore | None = None,
+    on_events_ingested: Callable[[list[StoredPhoneEvent]], Awaitable[None]] | None = None,
+) -> None:
     """启动 UDS 监听器并发布 /api/phone 端点；卸载或换代时先撤端点再关连接。"""
     path = socket_alias_path(ctx.runtime.workspace / "runtime", "phone-use.sock")
-    app = create_phone_app(bridge)
+    app = create_phone_app(bridge, event_store=event_store, on_events_ingested=on_events_ingested)
     server = PhoneListenerServer(
         uvicorn.Config(app, log_level="warning", lifespan="off", timeout_graceful_shutdown=5)
     )

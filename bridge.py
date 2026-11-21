@@ -53,6 +53,7 @@ class _NodeSession:
     supports_ack: bool = False
     supports_tree_v2: bool = False
     supports_apps: bool = False
+    supports_events: bool = False
     apps: tuple[PhoneApp, ...] | None = None
     connected_at: float = 0.0
     pending: dict[str, asyncio.Future[dict[str, object]]] = field(default_factory=dict)
@@ -174,6 +175,7 @@ class PhoneBridge:
             supports_ack=hello.get("supports_ack") is True,
             supports_tree_v2=hello.get("supports_tree_v2") is True,
             supports_apps=hello.get("supports_apps") is True,
+            supports_events=hello.get("supports_events") is True,
             connected_at=asyncio.get_running_loop().time(),
         )
         self._sessions[device_id] = session
@@ -476,6 +478,20 @@ class PhoneBridge:
     def supports_apps(self, device_id: str | None) -> bool:
         session = self._sessions.get(self.resolve_device_id(device_id))
         return session is not None and session.supports_apps
+
+    async def push_rules(self, rules_payload: Mapping[str, object]) -> int:
+        """向所有支持事件订阅的在线端侧设备实时下发最新规则表。"""
+        delivered = 0
+        frame: dict[str, object] = {"type": "rules", **rules_payload}
+        for session in tuple(self._sessions.values()):
+            if session.closed or not session.supports_events:
+                continue
+            try:
+                await session.send_json(frame)
+                delivered += 1
+            except (PhoneNodeError, OSError):
+                pass
+        return delivered
 
     async def finish_display(
         self,

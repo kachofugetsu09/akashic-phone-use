@@ -389,7 +389,7 @@ class _PhoneActionTool:
 
 api_version = 3
 name = "phone-use"
-version = "0.5.0"
+version = "0.5.1"
 desc = "连接并后台操作在线的 Android 手机端侧设备（无线调试虚拟屏、多适配器低功耗事件订阅与查询）"
 author = "Akashic"
 inject = (

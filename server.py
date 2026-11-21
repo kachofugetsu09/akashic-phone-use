@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = 10.0
 MIN_SHELL_VERSION = "0.5.0"
 # /api/phone/apk 下发的版本；可高于协议下限。
-BUNDLED_SHELL_VERSION = "0.6.0"
+BUNDLED_SHELL_VERSION = "0.6.1"
 
 
 class PhoneListenerServer(uvicorn.Server):

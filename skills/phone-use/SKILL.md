@@ -87,3 +87,15 @@ pixel-9 后台屏 #3 · com.eg.android.AlipayGphone · MainActivity
 ### Turn 结束自动收尾
 - 当前对话 Turn 闭合（`complete` / `quiet` / `abandoned`）时，插件的后台 follower 会向手机端发送 `finish` 请求释放虚拟屏幕。
 - 自动收尾只释放整个后台虚拟屏。工具不支持 `keep_packages` / `close_packages`，传入会明确报参数错误。收尾不保证应用已保留、关闭、停止发声或从最近任务消失，也不包含恢复静音或原剪贴板。
+
+## 3. 低功耗事件订阅与按需查询（`phone_events` / `device_subscribe`）
+- **五类系统回调适配器（0 轮询）**：
+  - `notification`：`NotificationListenerService` 实时捕获，支持单条规则设 `auto_cancel: true` 读完自动清除通知栏卡片。
+  - `foreground`：UID 2000 绑定 `ITaskStackListener` + `IProcessObserver` 实时切入切出记录（附 `UsageStatsManager` 游标断点补齐）。
+  - `appops`：`AppOpsManager.startWatchingActive` 监听定位（`FINE_LOCATION`）、相机（`CAMERA`）、麦克风（`RECORD_AUDIO`）激活与结束。
+  - `media`：`MediaSessionManager` 监听媒体播放状态与曲目/章节元数据（无需开通知权限）。
+  - `device`：系统广播与网络回调（解锁、息屏、充放电、Wi-Fi SSID/BSSID 切换）。
+- **省电机制**：高价值事件（`delivery: "realtime"`）防抖直传；常规流（`delivery: "batch"`）写端侧 SQLite Outbox，等解锁、切 Wi-Fi 或周期窗口打包上传，不抢 WakeLock。
+- **动态管理与查询**：
+  - `device_subscribe`：随时查看、新增/修改（支持 `ttl_seconds` 定时过期）、启停或删除订阅规则，改完立即实时推送给在线手机。
+  - `phone_events`：按需查询最近事件、应用前台会话时长或当前已知状态（同时注册进 `userinformation` 并按规则接入 `watch` 事件流）。

@@ -504,9 +504,11 @@ async def apply(ctx: Context) -> None:
     shell_tool = PhoneShellTool(bridge)
     file_tool = PhoneFileTool(bridge)
 
+    @asynccontextmanager
     async def _open_shell(_state: Mapping[str, object]) -> AsyncIterator[PhoneShellTool]:
         yield shell_tool
 
+    @asynccontextmanager
     async def _open_file(_state: Mapping[str, object]) -> AsyncIterator[PhoneFileTool]:
         yield file_tool
 

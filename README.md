@@ -19,7 +19,7 @@
 
 ## 配套版本与协议
 
-phone-use 需要 Akashic Shell 0.5.0 或更新版本（事件订阅与多适配器需要 0.6.0+，`exclude_packages` 黑名单与全适配器正则过滤需要 0.7.1+），`/api/phone/apk` 下发仓库内的 `akashic-shell-v0.7.1.apk`。
+phone-use 需要 Akashic Shell 0.5.0 或更新版本（事件订阅与多适配器需要 0.6.0+，`exclude_packages` 黑名单与全适配器正则过滤需要 0.7.1+），`/api/phone/apk` 下发仓库内的 `akashic-shell-v0.7.2.apk`。
 
 - **低功耗事件流与声明式订阅**：端侧通过 `NotificationListenerService`、UID 2000 进程/AppOps/MediaSession 回调、设备广播与 `UsageStats` 游标采集事件，按服务端下发的规则表在端侧过滤/脱敏/攒批后通过 `POST /api/phone/events` 幂等入库，接入 `WATCH_EVENTS` 与 `USER_INFORMATION`，并支持 `device_subscribe` 动态增删改规则。
 

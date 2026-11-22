@@ -170,5 +170,5 @@ def test_purge_events_removes_only_target_noise(tmp_path: Path):
 
 def test_bundled_apk_version_matches_file():
     root = Path(__file__).resolve().parents[1]
-    assert server_mod.BUNDLED_SHELL_VERSION == "0.7.1"
+    assert server_mod.BUNDLED_SHELL_VERSION == "0.7.2"
     assert (root / f"akashic-shell-v{server_mod.BUNDLED_SHELL_VERSION}.apk").is_file()

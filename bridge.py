@@ -449,6 +449,51 @@ class PhoneBridge:
         )
         return summary, snapshot
 
+    async def exec_shell(
+        self,
+        device_id: str | None,
+        command: str,
+        *,
+        timeout_ms: int = 15_000,
+        max_bytes: int = 131_072,
+    ) -> dict[str, object]:
+        return await self.rpc(
+            device_id,
+            "shell",
+            {"command": command, "timeout_ms": timeout_ms, "max_bytes": max_bytes},
+            timeout_ms=timeout_ms + 8_000,
+        )
+
+    async def read_file_chunk(
+        self,
+        device_id: str | None,
+        path: str,
+        *,
+        offset: int = 0,
+        max_bytes: int = 262_144,
+    ) -> dict[str, object]:
+        return await self.rpc(
+            device_id,
+            "file_read",
+            {"path": path, "offset": offset, "max_bytes": max_bytes},
+            timeout_ms=25_000,
+        )
+
+    async def write_file_chunk(
+        self,
+        device_id: str | None,
+        path: str,
+        base64_data: str,
+        *,
+        append: bool = False,
+    ) -> dict[str, object]:
+        return await self.rpc(
+            device_id,
+            "file_write",
+            {"path": path, "base64": base64_data, "append": append},
+            timeout_ms=25_000,
+        )
+
     async def launcher_apps(
         self, device_id: str | None, *, refresh: bool = False, timeout_ms: int = 10_000,
     ) -> tuple[PhoneApp, ...]:

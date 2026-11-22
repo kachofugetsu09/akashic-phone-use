@@ -488,3 +488,139 @@ class DeviceSubscribeTool:
     async def query(self, key: str) -> Result | None:
         _ = key
         return None
+
+
+class PhoneShellInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: str = Field(
+        min_length=1,
+        max_length=8000,
+        description="要在手机上以 UID 2000 (shell，等价 adb shell) 执行的命令，如 settings / cmd / svc / dumpsys / pm / am / logcat -d / ls。",
+    )
+    timeout_s: int = Field(default=15, ge=1, le=60, description="命令超时时间（秒），默认 15，最大 60。")
+    device_id: str | None = Field(default=None, description="目标设备 ID；仅一台在线时可省略。")
+
+
+class PhoneShellTool:
+    def __init__(self, bridge: PhoneBridge) -> None:
+        self._bridge = bridge
+
+    async def execute(self, arguments: Mapping[str, object]) -> Result:
+        params = PhoneShellInput.model_validate(json_value(arguments))
+        try:
+            res = await self._bridge.exec_shell(
+                params.device_id,
+                params.command,
+                timeout_ms=params.timeout_s * 1000,
+            )
+        except PhoneNodeError as error:
+            return Result(parts=(ContentPart("text", f"手机命令执行失败：{error}"),), outcome="error")
+
+        code = res.get("exit_code")
+        timed_out = bool(res.get("timed_out"))
+        truncated = bool(res.get("truncated"))
+        elapsed = res.get("elapsed_ms")
+        output = str(res.get("output") or "")
+        header = f"exit_code={code} elapsed_ms={elapsed}"
+        if timed_out:
+            header += " [TIMED_OUT]"
+        if truncated:
+            header += " [TRUNCATED]"
+        body = f"{header}\n{output}" if output else header
+        outcome = "success" if (code == 0 and not timed_out) else "error"
+        return Result(parts=(ContentPart("text", body),), outcome=outcome)
+
+
+class PhoneFileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["pull", "push"] = Field(description="pull：从手机拉取文件到服务器；push：把服务器文件推送到手机。")
+    remote_path: str = Field(
+        min_length=1,
+        description="手机端绝对路径（仅允许 /sdcard/...、/storage/emulated/0/... 或 /data/local/tmp/...）。",
+    )
+    local_path: str = Field(min_length=1, description="服务器本地绝对路径。")
+    device_id: str | None = Field(default=None, description="目标设备 ID；仅一台在线时可省略。")
+
+
+class PhoneFileTool:
+    MAX_FILE_BYTES = 20 * 1024 * 1024
+    CHUNK_BYTES = 262_144
+
+    def __init__(self, bridge: PhoneBridge) -> None:
+        self._bridge = bridge
+
+    async def execute(self, arguments: Mapping[str, object]) -> Result:
+        import base64
+        from pathlib import Path
+        from core.common.file_io import run_file_io
+
+        params = PhoneFileInput.model_validate(json_value(arguments))
+        local = Path(params.local_path)
+        if not local.is_absolute():
+            return Result(parts=(ContentPart("text", "local_path 必须是服务器上的绝对路径"),), outcome="error")
+
+        try:
+            if params.action == "pull":
+                offset = 0
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    res = await self._bridge.read_file_chunk(
+                        params.device_id, params.remote_path, offset=offset, max_bytes=self.CHUNK_BYTES
+                    )
+                    size = int(res.get("size") or 0)
+                    if size > self.MAX_FILE_BYTES:
+                        return Result(
+                            parts=(ContentPart("text", f"手机文件过大（{size} bytes，上限 20MB）"),),
+                            outcome="error",
+                        )
+                    b64 = str(res.get("base64") or "")
+                    data = base64.b64decode(b64) if b64 else b""
+                    if data:
+                        chunks.append(data)
+                        total += len(data)
+                        offset += len(data)
+                    if bool(res.get("eof")) or not data:
+                        break
+                payload = b"".join(chunks)
+
+                def _write_local() -> None:
+                    local.parent.mkdir(parents=True, exist_ok=True)
+                    local.write_bytes(payload)
+
+                await run_file_io(_write_local)
+                return Result(
+                    parts=(ContentPart("text", f"已从手机拉取 {params.remote_path} → {local}（{total} 字节）"),),
+                    outcome="success",
+                )
+            else:
+                def _read_local() -> bytes:
+                    if not local.is_file():
+                        raise FileNotFoundError(f"本地文件不存在: {local}")
+                    raw = local.read_bytes()
+                    if len(raw) > self.MAX_FILE_BYTES:
+                        raise ValueError(f"本地文件过大（{len(raw)} bytes，上限 20MB）")
+                    return raw
+
+                raw_bytes = await run_file_io(_read_local)
+                if not raw_bytes:
+                    await self._bridge.write_file_chunk(params.device_id, params.remote_path, "", append=False)
+                else:
+                    pos = 0
+                    first = True
+                    while pos < len(raw_bytes):
+                        chunk = raw_bytes[pos : pos + self.CHUNK_BYTES]
+                        b64 = base64.b64encode(chunk).decode("ascii")
+                        await self._bridge.write_file_chunk(
+                            params.device_id, params.remote_path, b64, append=not first
+                        )
+                        pos += len(chunk)
+                        first = False
+                return Result(
+                    parts=(ContentPart("text", f"已推送 {local} → 手机 {params.remote_path}（{len(raw_bytes)} 字节）"),),
+                    outcome="success",
+                )
+        except (PhoneNodeError, OSError, ValueError) as error:
+            return Result(parts=(ContentPart("text", f"手机文件传输失败：{error}"),), outcome="error")

@@ -42,7 +42,11 @@ from .tools import (
     PhoneDevicesTool,
     PhoneEventsInput,
     PhoneEventsTool,
+    PhoneFileInput,
+    PhoneFileTool,
     PhoneObserveInput,
+    PhoneShellInput,
+    PhoneShellTool,
     extract_turn_identity,
     parse_target,
     resolve_app,
@@ -497,6 +501,15 @@ async def apply(ctx: Context) -> None:
     async def _open_subscribe(_state: Mapping[str, object]) -> AsyncIterator[DeviceSubscribeTool]:
         yield subscribe_tool
 
+    shell_tool = PhoneShellTool(bridge)
+    file_tool = PhoneFileTool(bridge)
+
+    async def _open_shell(_state: Mapping[str, object]) -> AsyncIterator[PhoneShellTool]:
+        yield shell_tool
+
+    async def _open_file(_state: Mapping[str, object]) -> AsyncIterator[PhoneFileTool]:
+        yield file_tool
+
     catalog = ctx.require(TOOLS)
     _ = await catalog.declare_group(ctx, always_on=False, description=desc, icon="smartphone")
     await catalog.register(
@@ -536,6 +549,29 @@ async def apply(ctx: Context) -> None:
         open=_open_subscribe,
         idempotent=False,
         icon="bell-ring",
+    )
+    await catalog.register(
+        ctx,
+        name="phone_shell",
+        description=(
+            "在手机上以 UID 2000（等价 adb shell，不占屏幕、切 5G 也可用）执行任意命令，"
+            "覆盖 settings / cmd / svc / dumpsys / pm / am / logcat -d / ls 等全部 adb shell 能力。"
+        ),
+        parameters=PhoneShellInput.model_json_schema(),
+        open=_open_shell,
+        idempotent=False,
+        icon="terminal",
+    )
+    await catalog.register(
+        ctx,
+        name="phone_file",
+        description=(
+            "等价 adb pull / push：在服务器与手机 /sdcard、/storage/emulated/0、/data/local/tmp 之间双向传输文件（上限 20MB）。"
+        ),
+        parameters=PhoneFileInput.model_json_schema(),
+        open=_open_file,
+        idempotent=False,
+        icon="folder",
     )
     await catalog.register(
         ctx,

@@ -12,7 +12,7 @@ import time
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 AdapterKind = Literal["notification", "foreground", "appops", "media", "device"]
 DeliveryKind = Literal["realtime", "batch"]
@@ -48,10 +48,59 @@ class PhoneSubscriptionRule(BaseModel):
     id: str = Field(min_length=1, max_length=100)
     enabled: bool = True
     adapter: AdapterKind
-    package: str | None = Field(default="*", max_length=512)
+    package: str | None = Field(
+        default="*",
+        max_length=512,
+        description="目标包名：'*' 通配、逗号分隔白名单，或使用 '!pkg' 排除",
+    )
+    exclude_packages: list[str] = Field(
+        default_factory=list,
+        max_length=64,
+        description="黑名单包名列表；优先级高于 package 白名单与通配",
+    )
     match: RuleMatchConfig = Field(default_factory=RuleMatchConfig)
     actions: RuleActionsConfig = Field(default_factory=RuleActionsConfig)
     expires_at: float | None = Field(default=None, ge=0)
+
+    @field_validator("exclude_packages")
+    @classmethod
+    def _clean_exclude_packages(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            pkg = item.strip()
+            if not pkg:
+                continue
+            if len(pkg) > 256:
+                raise ValueError("exclude_packages 单项包名长度不能超过 256")
+            if pkg not in seen:
+                seen.add(pkg)
+                cleaned.append(pkg)
+        return cleaned
+
+    def matches_package(self, package_name: str) -> bool:
+        excludes = set(self.exclude_packages)
+        raw = (self.package or "*").strip()
+        includes: set[str] = set()
+        wildcard = raw in ("", "*")
+        if not wildcard:
+            for part in raw.split(","):
+                tok = part.strip()
+                if not tok:
+                    continue
+                if tok == "*":
+                    wildcard = True
+                elif tok.startswith("!"):
+                    neg = tok[1:].strip()
+                    if neg:
+                        excludes.add(neg)
+                else:
+                    includes.add(tok)
+            if not includes:
+                wildcard = True
+        if package_name in excludes:
+            return False
+        return wildcard or package_name in includes
 
     def to_wire(self) -> dict[str, object]:
         return self.model_dump(mode="json")
@@ -95,13 +144,14 @@ def default_rules() -> list[PhoneSubscriptionRule]:
             enabled=True,
             adapter="appops",
             package="*",
+            exclude_packages=["com.google.android.as"],
             match=RuleMatchConfig(ops=["FINE_LOCATION", "CAMERA", "RECORD_AUDIO"]),
             actions=RuleActionsConfig(
                 redact="full",
                 emit_watch=True,
                 watch_source="phone.appops",
                 watch_state=False,
-                cooldown_s=10,
+                cooldown_s=120,
                 delivery="batch",
             ),
         ),
@@ -279,6 +329,28 @@ class PhoneEventStore:
             if rule.expires_at is None or rule.expires_at > now_s
         ]
         return {"rules_version": version, "rules": active}
+
+    def purge_events(
+        self,
+        *,
+        package_name: str | None = None,
+        adapter: AdapterKind | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        args: list[object] = []
+        if package_name:
+            clauses.append("package_name = ?")
+            args.append(package_name)
+        if adapter:
+            clauses.append("adapter = ?")
+            args.append(adapter)
+        if not clauses:
+            raise ValueError("purge_events 必须至少指定 package_name 或 adapter")
+        sql = f"DELETE FROM events WHERE {' AND '.join(clauses)}"
+        with self._connect() as conn:
+            cur = conn.execute(sql, args)
+            conn.commit()
+            return int(cur.rowcount or 0)
 
     def list_rules(self, *, include_expired: bool = False) -> dict[str, object]:
         now_s = time.time()

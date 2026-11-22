@@ -369,7 +369,7 @@ class DeviceSubscribeInput(BaseModel):
         description="list（查看规则）、upsert（新增或覆盖规则并立即下发手机）、remove（删除规则）、enable/disable（启停规则）"
     )
     rule_id: str | None = Field(default=None, min_length=1, max_length=100, description="remove / enable / disable 时必填；upsert 时可写在 rule.id")
-    rule: PhoneSubscriptionRule | None = Field(default=None, description="upsert 时的完整订阅规则对象")
+    rule: PhoneSubscriptionRule | None = Field(default=None, description="upsert 时的完整订阅规则对象（支持 package 通配/白名单、exclude_packages 黑名单以及 match.title_regex/text_regex）")
     ttl_seconds: int | None = Field(default=None, ge=60, le=30 * 86_400, description="可选：给 upsert 规则设置有效期（秒），到期自动失效")
 
     @model_validator(mode="after")

@@ -506,6 +506,28 @@ class PhoneShellTool:
     def __init__(self, bridge: PhoneBridge) -> None:
         self._bridge = bridge
 
+    @property
+    def idempotent(self) -> bool:
+        return False
+
+    async def prepare(
+        self, arguments: Mapping[str, object], source: CallSource | None = None
+    ) -> Mapping[str, object] | str:
+        _ = source
+        try:
+            _ = PhoneShellInput.model_validate(json_value(arguments))
+            return arguments
+        except ValidationError as error:
+            return str(error)
+
+    async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
+        _ = key
+        return await self.execute(arguments)
+
+    async def query(self, key: str) -> Result | None:
+        _ = key
+        return None
+
     async def execute(self, arguments: Mapping[str, object]) -> Result:
         params = PhoneShellInput.model_validate(json_value(arguments))
         try:
@@ -550,6 +572,28 @@ class PhoneFileTool:
 
     def __init__(self, bridge: PhoneBridge) -> None:
         self._bridge = bridge
+
+    @property
+    def idempotent(self) -> bool:
+        return False
+
+    async def prepare(
+        self, arguments: Mapping[str, object], source: CallSource | None = None
+    ) -> Mapping[str, object] | str:
+        _ = source
+        try:
+            _ = PhoneFileInput.model_validate(json_value(arguments))
+            return arguments
+        except ValidationError as error:
+            return str(error)
+
+    async def invoke(self, key: str, arguments: Mapping[str, object]) -> Result:
+        _ = key
+        return await self.execute(arguments)
+
+    async def query(self, key: str) -> Result | None:
+        _ = key
+        return None
 
     async def execute(self, arguments: Mapping[str, object]) -> Result:
         import base64
